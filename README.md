@@ -1,33 +1,46 @@
 # RemnaNode Node Forge
 
-Однофайловый установщик небольшой панели управления RemnaNode для Ubuntu/Debian.
+Однофайловый установщик веб-мастера RemnaNode для Ubuntu и Debian. Он ставит
+Docker Engine, Docker Compose, Nginx и Certbot, создаёт `/opt/remnanode` и
+показывает адрес панели после установки.
 
-## Установка
+## Быстрая установка
 
-```bash
-chmod 700 install-remnanode-manager.sh
-sudo ./install-remnanode-manager.sh
-```
-
-Панель слушает только `127.0.0.1:8765`. Откройте SSH-туннель со своего компьютера:
+Для публичного репозитория:
 
 ```bash
-ssh -L 8765:127.0.0.1:8765 root@SERVER_IP
+curl -fsSL https://raw.githubusercontent.com/usupix/remnanode-node-forge/main/install-remnanode-manager.sh | sudo bash
 ```
 
-Затем откройте `http://127.0.0.1:8765`. Пароль сохраняется на сервере в
-`/root/remnanode-manager-access.txt`.
+В конце появятся уникальный адрес и пароль, например:
 
-## Возможности
+```text
+Open: http://203.0.113.10/4f82c0d8a191e724/
+Password: generated-password
+```
 
-- проверка и запуск полного `docker-compose.yml` для сервиса `remnanode`;
-- автоматическое добавление read-only volume с сертификатами Xray;
-- выпуск сертификата Let's Encrypt после проверки DNS;
-- Nginx-сайт-приманка на 80 и TLS fallback на `127.0.0.1:8443`;
-- генерация VLESS Reality self-steal и Hysteria 2 inbound;
-- профили BBR-only и BBR с умеренными сетевыми буферами;
-- резервные копии Compose, Nginx и sysctl перед заменой;
-- просмотр статуса, версии, перезапусков и последних логов ноды.
+Путь состоит из 16 случайных символов. Backend панели остаётся на
+`127.0.0.1:8765`, а наружу его публикует Nginx только по этому пути. Данные для
+входа также сохраняются в `/root/remnanode-manager-access.txt`.
 
-При продлении сертификата deploy-hook копирует новые файлы в каталог Xray и
-перезапускает существующий контейнер `remnanode`.
+> Пока используется HTTP, пароль не зашифрован на пути до сервера. Используйте
+> панель только для первоначальной настройки, затем ограничьте доступ или
+> переведите её на HTTPS.
+
+## Что умеет панель
+
+- принять полный `docker-compose.yml` из Remnawave и проверить его до замены;
+- создать `/opt/remnanode/docker-compose.yml`, скачать образ и запустить ноду;
+- автоматически добавить read-only volume сертификатов Xray;
+- проверить DNS и выпустить сертификат Let's Encrypt;
+- положить `.pem` и `.key` в `/var/lib/remnawave/configs/xray/ssl`;
+- обновлять сертификаты deploy-hook’ом Certbot и перезапускать ноду;
+- создать Nginx-сайт-приманку и TLS fallback на `127.0.0.1:8443`;
+- генерировать VLESS Reality self-steal и Hysteria 2 inbound;
+- независимо включать BBR, TCP Fast Open, MTU probing, VPN-буферы и очереди;
+- возвращать снятые сетевые настройки к значениям, сохранённым при установке;
+- показывать состояние контейнера, версии, перезапуски и последние логи;
+- создавать резервные копии Compose, Nginx и sysctl перед изменениями.
+
+Официальная последовательность Remnawave сохранена: Docker → каталог
+`/opt/remnanode` → Compose из карточки ноды → `docker compose up -d`.

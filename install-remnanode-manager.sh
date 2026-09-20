@@ -10,19 +10,21 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends python3 python3-yaml nginx certbot openssl ca-certificates curl
 
+# Remnawave's official node guide uses get.docker.com. Download first so a
+# failed transfer can never be piped into a privileged shell.
 if ! command -v docker >/dev/null 2>&1; then
-  apt-get install -y --no-install-recommends docker.io
+  docker_installer=$(mktemp)
+  curl -fsSL https://get.docker.com -o "$docker_installer"
+  sh "$docker_installer"
+  rm -f -- "$docker_installer"
 fi
 if ! docker compose version >/dev/null 2>&1; then
-  if apt-cache show docker-compose-v2 >/dev/null 2>&1; then
-    apt-get install -y --no-install-recommends docker-compose-v2
-  else
-    apt-get install -y --no-install-recommends docker-compose-plugin
-  fi
+  apt-get install -y --no-install-recommends docker-compose-plugin
 fi
 systemctl enable --now docker nginx
 
 install -d -m 0750 /opt/remnanode-manager
+install -d -m 0750 /opt/remnanode
 install -d -m 0700 /var/lib/remnanode-manager/backups /var/lib/remnanode-manager/generated
 install -d -m 0755 /var/www/remnanode-manager-acme/.well-known/acme-challenge
 install -d -m 0755 /var/www/remnanode-decoy
@@ -58,13 +60,22 @@ COMPOSE_FILE = COMPOSE_DIR / "docker-compose.yml"
 SSL_DIR = Path("/var/lib/remnawave/configs/xray/ssl")
 SYSCTL_BBR = Path("/etc/sysctl.d/99-vpn-bbr.conf")
 SYSCTL_TUNE = Path("/etc/sysctl.d/99-remnanode-manager-network.conf")
+NETWORK_BASELINE = STATE_DIR / "network-baseline.json"
 ADMIN_PASSWORD = os.environ["RNM_ADMIN_PASSWORD"]
 SESSION_SECRET = os.environ["RNM_SESSION_SECRET"].encode()
 BIND = os.getenv("RNM_BIND", "127.0.0.1")
 PORT = int(os.getenv("RNM_PORT", "8765"))
+BASE_PATH = "/" + os.environ["RNM_BASE_PATH"].strip("/")
 DOMAIN_RE = re.compile(r"(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 TAG_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}$")
 attempts = {}
+
+NETWORK_KEYS = [
+    "net.core.default_qdisc", "net.ipv4.tcp_congestion_control",
+    "net.ipv4.tcp_fastopen", "net.ipv4.tcp_mtu_probing",
+    "net.core.rmem_max", "net.core.wmem_max", "net.core.netdev_max_backlog",
+    "net.core.somaxconn", "net.ipv4.tcp_rmem", "net.ipv4.tcp_wmem",
+]
 
 
 def run(args, *, cwd=None, timeout=300, check=True):
@@ -86,7 +97,7 @@ def atomic_write(path: Path, data: str, mode=0o600):
 
 
 def backup(paths, label):
-    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(2)
     target = BACKUP_DIR / f"{stamp}-{label}"
     target.mkdir(parents=True, exist_ok=False)
     os.chmod(target, 0o700)
@@ -95,6 +106,22 @@ def backup(paths, label):
         if path.exists():
             shutil.copy2(path, target / path.name)
     return target
+
+
+def read_sysctl(key):
+    return run(["sysctl", "-n", key], check=False, timeout=10).strip()
+
+
+def network_baseline():
+    if not NETWORK_BASELINE.exists():
+        values = {key: read_sysctl(key) for key in NETWORK_KEYS}
+        atomic_write(NETWORK_BASELINE, json.dumps(values, indent=2) + "\n", 0o600)
+    return json.loads(NETWORK_BASELINE.read_text(encoding="utf-8"))
+
+
+def web_path(suffix=""):
+    suffix = suffix.lstrip("/")
+    return BASE_PATH + "/" + suffix
 
 
 def session_token():
@@ -125,6 +152,10 @@ def status_data():
         state, image, restarts = inspect.split("|", 2)
     bbr = run(["sysctl", "-n", "net.ipv4.tcp_congestion_control"], check=False, timeout=10) or "unknown"
     qdisc = run(["sysctl", "-n", "net.core.default_qdisc"], check=False, timeout=10) or "unknown"
+    fastopen = read_sysctl("net.ipv4.tcp_fastopen") or "unknown"
+    mtu_probing = read_sysctl("net.ipv4.tcp_mtu_probing") or "unknown"
+    rmem_max = read_sysctl("net.core.rmem_max") or "unknown"
+    backlog = read_sysctl("net.core.netdev_max_backlog") or "unknown"
     public_ip = "unknown"
     try:
         public_ip = urllib.request.urlopen("https://api.ipify.org", timeout=4).read().decode().strip()
@@ -138,9 +169,40 @@ def status_data():
     return {
         "docker": docker_version, "compose": compose_version, "state": state,
         "image": image, "restarts": restarts, "bbr": bbr, "qdisc": qdisc,
+        "fastopen": fastopen, "mtu_probing": mtu_probing, "rmem_max": rmem_max,
+        "backlog": backlog,
         "public_ip": public_ip, "compose_hash": compose_hash, "certs": certs,
         "logs": redact(logs[-7000:]),
     }
+
+
+def ensure_cert_volume(config):
+    if not isinstance(config, dict) or not isinstance(config.get("services"), dict):
+        raise ValueError("Compose must contain a services object.")
+    service = config["services"].get("remnanode")
+    if not isinstance(service, dict):
+        raise ValueError("Service remnanode was not found.")
+    volumes = service.setdefault("volumes", [])
+    if not isinstance(volumes, list):
+        raise ValueError("remnanode.volumes must be a list.")
+    mount = "/var/lib/remnawave/configs/xray/ssl:/var/lib/remnawave/configs/xray/ssl:ro"
+    host_ssl_dir = str(SSL_DIR).replace("\\", "/")
+    if not any(isinstance(item, str) and item.split(":", 1)[0] == host_ssl_dir for item in volumes):
+        volumes.append(mount)
+        return True
+    return False
+
+
+def write_compose(config, label):
+    rendered = yaml.safe_dump(config, sort_keys=False, allow_unicode=True, width=4096)
+    COMPOSE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = COMPOSE_DIR / ".docker-compose.candidate.yml"
+    atomic_write(tmp, rendered)
+    run(["docker", "compose", "-f", str(tmp), "config", "-q"], timeout=30)
+    saved = backup([COMPOSE_FILE], label)
+    os.replace(tmp, COMPOSE_FILE)
+    os.chmod(COMPOSE_FILE, 0o600)
+    return saved
 
 
 def apply_compose(form):
@@ -150,26 +212,12 @@ def apply_compose(form):
     if len(raw.encode()) > 900_000:
         raise ValueError("Compose file is too large.")
     config = yaml.safe_load(raw)
-    if not isinstance(config, dict) or not isinstance(config.get("services"), dict):
-        raise ValueError("Compose must contain a services object.")
-    service = config["services"].get("remnanode")
-    if not isinstance(service, dict):
-        raise ValueError("Service remnanode was not found.")
     if form.get("cert_volume") == ["1"]:
-        volumes = service.setdefault("volumes", [])
-        if not isinstance(volumes, list):
-            raise ValueError("remnanode.volumes must be a list.")
-        mount = "/var/lib/remnawave/configs/xray/ssl:/var/lib/remnawave/configs/xray/ssl:ro"
-        if not any(str(item).split(":", 1)[0] == str(SSL_DIR) for item in volumes):
-            volumes.append(mount)
-    rendered = yaml.safe_dump(config, sort_keys=False, allow_unicode=True, width=4096)
-    COMPOSE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = COMPOSE_DIR / ".docker-compose.candidate.yml"
-    atomic_write(tmp, rendered)
-    run(["docker", "compose", "-f", str(tmp), "config", "-q"], timeout=30)
-    saved = backup([COMPOSE_FILE], "compose")
-    os.replace(tmp, COMPOSE_FILE)
-    os.chmod(COMPOSE_FILE, 0o600)
+        ensure_cert_volume(config)
+    else:
+        if not isinstance(config, dict) or not isinstance(config.get("services"), dict) or not isinstance(config["services"].get("remnanode"), dict):
+            raise ValueError("Compose must contain services.remnanode.")
+    saved = write_compose(config, "compose")
     if form.get("pull") == ["1"]:
         run(["docker", "compose", "pull"], cwd=COMPOSE_DIR, timeout=900)
     run(["docker", "compose", "up", "-d"], cwd=COMPOSE_DIR, timeout=300)
@@ -253,9 +301,17 @@ def issue_certificate(form):
     run(["nginx", "-t"], timeout=20)
     run(["systemctl", "reload", "nginx"], timeout=20)
     run(["systemctl", "enable", "--now", "certbot.timer"], check=False, timeout=20)
-    if form.get("restart_node") == ["1"] and run(["docker", "inspect", "remnanode"], check=False):
+    volume_note = ""
+    if form.get("cert_volume") == ["1"] and COMPOSE_FILE.exists():
+        config = yaml.safe_load(COMPOSE_FILE.read_text(encoding="utf-8"))
+        if ensure_cert_volume(config):
+            write_compose(config, "certificate-volume")
+            run(["docker", "compose", "up", "-d"], cwd=COMPOSE_DIR, timeout=300)
+            volume_note = " Certificate volume added to Compose."
+    containers = run(["docker", "ps", "-a", "--format", "{{.Names}}"], check=False).splitlines()
+    if form.get("restart_node") == ["1"] and "remnanode" in containers:
         run(["docker", "restart", "remnanode"], timeout=120)
-    return f"Certificate issued: {SSL_DIR}/{domain}.pem and {domain}.key"
+    return f"Certificate issued: {SSL_DIR}/{domain}.pem and {domain}.key.{volume_note}"
 
 
 def reality_keys():
@@ -338,34 +394,34 @@ def generate_inbound(form):
 
 
 def apply_network(form):
-    profile = form.get("profile", ["bbr"])[0]
     saved = backup([SYSCTL_BBR, SYSCTL_TUNE], "network")
-    atomic_write(SYSCTL_BBR, "net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n", 0o644)
-    if profile == "balanced":
-        atomic_write(SYSCTL_TUNE, """# Conservative VPN transport profile
-net.core.rmem_max=16777216
-net.core.wmem_max=16777216
-net.core.netdev_max_backlog=8192
-net.core.somaxconn=8192
-net.core.optmem_max=65536
-net.ipv4.tcp_rmem=4096 131072 16777216
-net.ipv4.tcp_wmem=4096 65536 16777216
-net.ipv4.tcp_max_syn_backlog=8192
-net.ipv4.tcp_max_tw_buckets=262144
-net.ipv4.ip_local_port_range=10240 65535
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_mtu_probing=1
-net.ipv4.tcp_slow_start_after_idle=0
-net.ipv4.udp_rmem_min=8192
-net.ipv4.udp_wmem_min=8192
-""", 0o644)
-    elif profile == "bbr":
-        atomic_write(SYSCTL_TUNE, "# BBR-only profile selected in RemnaNode Manager.\n", 0o644)
-    else:
-        raise ValueError("Unknown network profile.")
-    run(["modprobe", "tcp_bbr"], timeout=20)
-    run(["sysctl", "--system"], timeout=60)
-    return f"Network profile {profile} applied. Backup: {saved}"
+    base = network_baseline()
+    bbr = form.get("bbr") == ["1"]
+    fastopen = form.get("fastopen") == ["1"]
+    mtu = form.get("mtu") == ["1"]
+    buffers = form.get("buffers") == ["1"]
+    backlog = form.get("backlog") == ["1"]
+    if bbr:
+        run(["modprobe", "tcp_bbr"], timeout=20)
+    values = {
+        "net.core.default_qdisc": "fq" if bbr else base["net.core.default_qdisc"],
+        "net.ipv4.tcp_congestion_control": "bbr" if bbr else base["net.ipv4.tcp_congestion_control"],
+        "net.ipv4.tcp_fastopen": "3" if fastopen else base["net.ipv4.tcp_fastopen"],
+        "net.ipv4.tcp_mtu_probing": "1" if mtu else base["net.ipv4.tcp_mtu_probing"],
+        "net.core.rmem_max": "16777216" if buffers else base["net.core.rmem_max"],
+        "net.core.wmem_max": "16777216" if buffers else base["net.core.wmem_max"],
+        "net.ipv4.tcp_rmem": "4096 131072 16777216" if buffers else base["net.ipv4.tcp_rmem"],
+        "net.ipv4.tcp_wmem": "4096 65536 16777216" if buffers else base["net.ipv4.tcp_wmem"],
+        "net.core.netdev_max_backlog": "8192" if backlog else base["net.core.netdev_max_backlog"],
+        "net.core.somaxconn": "8192" if backlog else base["net.core.somaxconn"],
+    }
+    body = "# Managed by RemnaNode Node Forge. Unchecked controls restore install-time values.\n"
+    body += "".join(f"{key}={value}\n" for key, value in values.items())
+    atomic_write(SYSCTL_BBR, "# Compatibility marker; settings are stored in 99-remnanode-manager-network.conf.\n", 0o644)
+    atomic_write(SYSCTL_TUNE, body, 0o644)
+    run(["sysctl", "-p", str(SYSCTL_TUNE)], timeout=60)
+    enabled = [name for name, on in (("BBR", bbr), ("Fast Open", fastopen), ("MTU probing", mtu), ("buffers", buffers), ("backlog", backlog)) if on]
+    return f"Network settings applied: {', '.join(enabled) or 'baseline restored'}. Backup: {saved}"
 
 
 def node_action(form):
@@ -389,7 +445,7 @@ CSS = r'''
 
 
 def render_login(error=""):
-    return f'''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Node Forge login</title><style>{CSS}.login{{max-width:460px;margin:12vh auto;padding:28px;background:var(--panel);border:1px solid var(--line)}}.login h1{{font-size:48px}}</style><div class="login"><div class="eyebrow">Meltun infrastructure</div><h1>Node<br>Forge</h1>{f'<p class="error">{html.escape(error)}</p>' if error else ''}<form method="post" action="/login"><label>Пароль администратора</label><input autofocus type="password" name="password" autocomplete="current-password"><button style="margin-top:16px">Открыть панель</button></form><p class="muted">Интерфейс доступен только через защищённый SSH-туннель.</p></div></html>'''
+    return f'''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Node Forge login</title><style>{CSS}.login{{max-width:460px;margin:12vh auto;padding:28px;background:var(--panel);border:1px solid var(--line)}}.login h1{{font-size:48px}}</style><div class="login"><div class="eyebrow">Meltun infrastructure</div><h1>Node<br>Forge</h1>{f'<p class="error">{html.escape(error)}</p>' if error else ''}<form method="post" action="{web_path('login')}"><label>Пароль администратора</label><input autofocus type="password" name="password" autocomplete="current-password"><button style="margin-top:16px">Открыть панель</button></form><p class="muted">Панель защищена секретным URL и отдельным паролем. Пока используется HTTP, не открывай её в чужой сети.</p></div></html>'''
 
 
 def render_dashboard(message="", error=""):
@@ -400,15 +456,15 @@ def render_dashboard(message="", error=""):
     flash = f'<div class="flash">{html.escape(message)}</div>' if message else ""
     flash += f'<div class="flash error">{html.escape(error)}</div>' if error else ""
     inbound = f'''<div class="copybox"><button class="secondary" onclick="copyInbound();return false">Копировать</button><pre id="inbound">{html.escape(last)}</pre></div><p class="mono muted">Public key: {html.escape(meta.get('publicKey','—'))} · Short ID: {html.escape(meta.get('shortId','—'))}</p>''' if last else '<p class="muted">Сгенерированный inbound появится здесь.</p>'
-    return f'''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Node Forge</title><style>{CSS}</style><div class="shell"><header class="mast"><div><div class="eyebrow">Meltun infrastructure / privileged console</div><h1>Node Forge</h1></div><div class="rail"><span class="pulse"></span>{html.escape(s['public_ip'])} · local control</div></header>{flash}<main class="grid">
-<section class="card"><div class="label">Runtime</div><h2>Состояние узла</h2><div class="metric"><span>RemnaNode</span><b class="{'ok' if s['state']=='running' else 'warn'}">{html.escape(s['state'])}</b></div><div class="metric"><span>Перезапуски</span><b>{html.escape(s['restarts'])}</b></div><div class="metric"><span>Docker</span><b>{html.escape(s['docker'])}</b></div><div class="metric"><span>Compose</span><b>{html.escape(s['compose'])}</b></div><div class="actions"><form method="post" action="/action"><input type="hidden" name="csrf" value="{csrf_token()}"><button name="action" value="start">Запустить</button><button class="secondary" name="action" value="restart">Перезапустить</button><button class="secondary" name="action" value="pull">Обновить</button></form></div></section>
-<section class="card"><div class="label">Kernel</div><h2>Сеть</h2><div class="metric"><span>Congestion</span><b class="ok">{html.escape(s['bbr'])}</b></div><div class="metric"><span>Queue</span><b>{html.escape(s['qdisc'])}</b></div><form method="post" action="/network"><input type="hidden" name="csrf" value="{csrf_token()}"><label>Профиль</label><select name="profile"><option value="bbr">Только BBR + fq</option><option value="balanced">BBR + безопасные VPN-буферы</option></select><button style="margin-top:16px">Применить сеть</button></form></section>
+    return f'''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Node Forge</title><style>{CSS}</style><div class="shell"><header class="mast"><div><div class="eyebrow">Meltun infrastructure / node workshop</div><h1>Node Forge</h1></div><div class="rail"><span class="pulse"></span>{html.escape(s['public_ip'])} · secret path</div></header>{flash}<main class="grid">
+<section class="card"><div class="label">Runtime</div><h2>Состояние узла</h2><div class="metric"><span>RemnaNode</span><b class="{'ok' if s['state']=='running' else 'warn'}">{html.escape(s['state'])}</b></div><div class="metric"><span>Перезапуски</span><b>{html.escape(s['restarts'])}</b></div><div class="metric"><span>Docker</span><b>{html.escape(s['docker'])}</b></div><div class="metric"><span>Compose</span><b>{html.escape(s['compose'])}</b></div><div class="actions"><form method="post" action="{web_path('action')}"><input type="hidden" name="csrf" value="{csrf_token()}"><button name="action" value="start">Запустить</button><button class="secondary" name="action" value="restart">Перезапустить</button><button class="secondary" name="action" value="pull">Обновить</button></form></div></section>
+<section class="card"><div class="label">Kernel controls</div><h2>Сеть</h2><div class="metric"><span>Congestion</span><b class="ok">{html.escape(s['bbr'])}</b></div><div class="metric"><span>Queue</span><b>{html.escape(s['qdisc'])}</b></div><div class="metric"><span>Fast Open / MTU</span><b>{html.escape(s['fastopen'])} / {html.escape(s['mtu_probing'])}</b></div><form method="post" action="{web_path('network')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label class="check"><input type="checkbox" name="bbr" value="1" {'checked' if s['bbr']=='bbr' else ''}> BBR + fq</label><label class="check"><input type="checkbox" name="fastopen" value="1" {'checked' if s['fastopen']=='3' else ''}> TCP Fast Open</label><label class="check"><input type="checkbox" name="mtu" value="1" {'checked' if s['mtu_probing']=='1' else ''}> MTU probing</label><label class="check"><input type="checkbox" name="buffers" value="1" {'checked' if s['rmem_max']=='16777216' else ''}> VPN-буферы 16 MiB</label><label class="check"><input type="checkbox" name="backlog" value="1" {'checked' if s['backlog']=='8192' else ''}> Очереди 8192</label><button style="margin-top:16px">Применить переключатели</button></form><p class="muted">Снятый флажок возвращает значение, которое было до установки панели.</p></section>
 <section class="card"><div class="label">Certificates</div><h2>Хранилище TLS</h2><div class="certs">{certs}</div><p class="muted">Файлы копируются в каталог Xray и обновляются deploy-hook’ом Certbot.</p></section>
-<section class="card wide"><div class="label">01 / Node deployment</div><h2>Docker Compose RemnaNode</h2><form method="post" action="/compose"><input type="hidden" name="csrf" value="{csrf_token()}"><textarea name="compose" spellcheck="false" placeholder="Вставь полный docker-compose.yml"></textarea><div class="row"><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Добавить volume сертификатов</label><label class="check"><input type="checkbox" name="pull" value="1" checked> Скачать свежий образ</label></div><button>Проверить и запустить</button></form><p class="mono muted">Текущий SHA-256: {html.escape(s['compose_hash'])}. Перед каждой заменой создаётся резервная копия.</p></section>
-<section class="card"><div class="label">02 / Certificate</div><h2>Выпустить сертификат</h2><form method="post" action="/cert"><input type="hidden" name="csrf" value="{csrf_token()}"><label>Домен</label><input name="domain" placeholder="node.example.com" required><label>Email Let's Encrypt</label><input type="email" name="email" required><label class="check"><input type="checkbox" name="restart_node" value="1"> Перезапустить ноду после выпуска</label><label class="check"><input type="checkbox" name="force_dns" value="1"> Игнорировать несовпадение DNS</label><button>Проверить DNS и выпустить</button></form></section>
-<section class="card full"><div class="label">03 / Profile builder</div><h2>Сгенерировать inbound</h2><form method="post" action="/inbound"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Тип</label><select name="kind"><option value="reality">VLESS TCP Reality + self-steal</option><option value="hysteria">Hysteria 2 TLS</option></select></div><div><label>Tag</label><input name="tag" value="VLESS_REALITY"></div><div><label>Порт</label><input type="number" min="1" max="65535" name="inbound_port" value="2053"></div><div><label>Домен</label><input name="inbound_domain" placeholder="node.example.com" required></div></div><button>Сгенерировать inbound</button></form>{inbound}</section>
+<section class="card wide"><div class="label">01 / Node deployment</div><h2>Docker Compose RemnaNode</h2><form method="post" action="{web_path('compose')}"><input type="hidden" name="csrf" value="{csrf_token()}"><textarea name="compose" spellcheck="false" placeholder="Вставь полный docker-compose.yml из Remnawave"></textarea><div class="row"><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Добавить volume сертификатов</label><label class="check"><input type="checkbox" name="pull" value="1" checked> Скачать свежий образ</label></div><button>Проверить и запустить</button></form><p class="mono muted">Каталог: /opt/remnanode · SHA-256: {html.escape(s['compose_hash'])}. Перед заменой создаётся резервная копия.</p></section>
+<section class="card"><div class="label">02 / Certificate</div><h2>Выпустить сертификат</h2><form method="post" action="{web_path('cert')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label>Домен</label><input name="domain" placeholder="node.example.com" required><label>Email Let's Encrypt</label><input type="email" name="email" required><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Добавить volume в существующий Compose</label><label class="check"><input type="checkbox" name="restart_node" value="1" checked> Перезапустить ноду после выпуска</label><label class="check"><input type="checkbox" name="force_dns" value="1"> Игнорировать несовпадение DNS</label><button>Проверить DNS и выпустить</button></form></section>
+<section class="card full"><div class="label">03 / Profile builder</div><h2>Сгенерировать inbound</h2><form method="post" action="{web_path('inbound')}"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Тип</label><select name="kind"><option value="reality">VLESS TCP Reality + self-steal</option><option value="hysteria">Hysteria 2 TLS</option></select></div><div><label>Tag</label><input name="tag" value="VLESS_REALITY"></div><div><label>Порт</label><input type="number" min="1" max="65535" name="inbound_port" value="2053"></div><div><label>Домен</label><input name="inbound_domain" placeholder="node.example.com" required></div></div><button>Сгенерировать inbound</button></form>{inbound}</section>
 <section class="card full"><div class="label">Live tail</div><h2>Последние события RemnaNode</h2><pre>{html.escape(s['logs'] or 'Контейнер ещё не запускался.')}</pre></section>
-</main><footer>Node Forge binds to {html.escape(BIND)}:{PORT} · <a class="muted" href="/logout">Выйти</a></footer></div><script>function copyInbound(){{navigator.clipboard.writeText(document.getElementById('inbound').innerText)}}</script></html>'''
+</main><footer>Node Forge backend: {html.escape(BIND)}:{PORT} · public route: {html.escape(BASE_PATH)}/ · <a class="muted" href="{web_path('logout')}">Выйти</a></footer></div><script>function copyInbound(){{navigator.clipboard.writeText(document.getElementById('inbound').innerText)}}</script></html>'''
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -430,41 +486,49 @@ class Handler(BaseHTTPRequestHandler):
     def authed(self):
         jar = cookies.SimpleCookie(self.headers.get("Cookie", ""))
         return "rnm_session" in jar and hmac.compare_digest(jar["rnm_session"].value, session_token())
+    def routed(self):
+        path, _, query = self.path.partition("?")
+        if path == BASE_PATH: return "/", query
+        if not path.startswith(BASE_PATH + "/"): return None, query
+        return path[len(BASE_PATH):] or "/", query
     def form(self):
         length = int(self.headers.get("Content-Length", "0"))
         if length > 1_000_000: raise ValueError("Request is too large.")
         return urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "replace"), keep_blank_values=True)
     def redirect(self, message="", error=""):
         query = urllib.parse.urlencode({"ok": message, "error": error})
-        self.send_response(303); self.send_header("Location", "/?" + query); self.end_headers()
+        self.send_response(303); self.send_header("Location", web_path() + "?" + query); self.end_headers()
     def do_GET(self):
-        path, _, query = self.path.partition("?")
+        path, query = self.routed()
+        if path is None: return self.send_html("Not found", 404)
         if path == "/logout":
-            return self.send_html(render_login(), headers={"Set-Cookie": "rnm_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/"})
+            return self.send_html(render_login(), headers={"Set-Cookie": f"rnm_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path={web_path()}"})
         if not self.authed(): return self.send_html(render_login(), 401)
         args = urllib.parse.parse_qs(query)
         return self.send_html(render_dashboard(args.get("ok", [""])[0], args.get("error", [""])[0]))
     def do_POST(self):
+        path, _ = self.routed()
+        if path is None: return self.send_html("Not found", 404)
         try: form = self.form()
         except Exception as exc: return self.send_html(render_login(str(exc)), 400)
-        if self.path == "/login":
+        if path == "/login":
             ip = self.client_address[0]; now = time.time(); record = attempts.get(ip, [])
             record = [x for x in record if now - x < 60]; attempts[ip] = record
             if len(record) >= 5: return self.send_html(render_login("Too many attempts. Wait one minute."), 429)
             if hmac.compare_digest(form.get("password", [""])[0], ADMIN_PASSWORD):
                 attempts.pop(ip, None)
-                self.send_response(303); self.send_header("Location", "/")
-                self.send_header("Set-Cookie", f"rnm_session={session_token()}; HttpOnly; SameSite=Strict; Path=/")
+                self.send_response(303); self.send_header("Location", web_path())
+                self.send_header("Set-Cookie", f"rnm_session={session_token()}; HttpOnly; SameSite=Strict; Path={web_path()}")
                 return self.end_headers()
             record.append(now); return self.send_html(render_login("Wrong password."), 401)
         if not self.authed(): return self.send_html(render_login(), 401)
         if not hmac.compare_digest(form.get("csrf", [""])[0], csrf_token()): return self.redirect(error="CSRF validation failed.")
         try:
-            if self.path == "/compose": message = apply_compose(form)
-            elif self.path == "/cert": message = issue_certificate(form)
-            elif self.path == "/network": message = apply_network(form)
-            elif self.path == "/inbound": message = generate_inbound(form)
-            elif self.path == "/action": message = node_action(form)
+            if path == "/compose": message = apply_compose(form)
+            elif path == "/cert": message = issue_certificate(form)
+            elif path == "/network": message = apply_network(form)
+            elif path == "/inbound": message = generate_inbound(form)
+            elif path == "/action": message = node_action(form)
             else: raise ValueError("Unknown action.")
             self.redirect(message=message)
         except Exception as exc:
@@ -472,6 +536,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    network_baseline()
     ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
 PY
 chmod 0750 /opt/remnanode-manager/app.py
@@ -494,16 +559,23 @@ chmod 0750 /usr/local/sbin/remnanode-sync-certs
 install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
 ln -sfn /usr/local/sbin/remnanode-sync-certs /etc/letsencrypt/renewal-hooks/deploy/remnanode-sync-certs
 
+public_ip=$(curl -4fsS --max-time 8 https://api.ipify.org || hostname -I | awk '{print $1}')
+
 if [[ ! -e /etc/remnanode-manager.env ]]; then
   admin_password=$(openssl rand -base64 18 | tr -d '\n=/+' | head -c 22)
   session_secret=$(openssl rand -hex 32)
+  manager_path=$(openssl rand -hex 8)
   cat > /etc/remnanode-manager.env <<EOF
 RNM_ADMIN_PASSWORD=$admin_password
 RNM_SESSION_SECRET=$session_secret
 RNM_BIND=127.0.0.1
 RNM_PORT=8765
+RNM_BASE_PATH=$manager_path
 EOF
   chmod 0600 /etc/remnanode-manager.env
+fi
+if ! grep -q '^RNM_BASE_PATH=' /etc/remnanode-manager.env; then
+  printf 'RNM_BASE_PATH=%s\n' "$(openssl rand -hex 8)" >> /etc/remnanode-manager.env
 fi
 
 cat > /etc/systemd/system/remnanode-manager.service <<'UNIT'
@@ -531,18 +603,60 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
-systemctl enable --now remnanode-manager.service
+systemctl enable remnanode-manager.service
+systemctl restart remnanode-manager.service
 
-public_ip=$(curl -4fsS --max-time 5 https://api.ipify.org || hostname -I | awk '{print $1}')
 admin_password=$(sed -n 's/^RNM_ADMIN_PASSWORD=//p' /etc/remnanode-manager.env)
+manager_path=$(sed -n 's/^RNM_BASE_PATH=//p' /etc/remnanode-manager.env)
+
+cat > /etc/nginx/sites-available/remnanode-manager <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $public_ip;
+    server_tokens off;
+
+    location = /$manager_path {
+        return 302 /$manager_path/;
+    }
+
+    location ^~ /$manager_path/ {
+        proxy_pass http://127.0.0.1:8765;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 1200s;
+        proxy_send_timeout 1200s;
+        client_max_body_size 1m;
+        add_header X-Frame-Options DENY always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy no-referrer always;
+        add_header Cache-Control no-store always;
+    }
+
+    location / {
+        return 404;
+    }
+}
+EOF
+ln -sfn /etc/nginx/sites-available/remnanode-manager /etc/nginx/sites-enabled/remnanode-manager
+nginx -t
+systemctl reload nginx
+
 cat > /root/remnanode-manager-access.txt <<EOF
 RemnaNode Node Forge
-SSH tunnel: ssh -L 8765:127.0.0.1:8765 root@$public_ip
-Open: http://127.0.0.1:8765
+Open: http://$public_ip/$manager_path/
 Password: $admin_password
+Backend: 127.0.0.1:8765
 EOF
 chmod 0600 /root/remnanode-manager-access.txt
 
-systemctl --no-pager --full status remnanode-manager.service | head -n 20
-echo
+if ! systemctl is-active --quiet remnanode-manager.service; then
+  journalctl -u remnanode-manager.service --no-pager -n 40
+  exit 1
+fi
+printf 'Service: %s\n\n' "$(systemctl is-active remnanode-manager.service)"
 cat /root/remnanode-manager-access.txt
