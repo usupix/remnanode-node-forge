@@ -237,7 +237,7 @@ def nginx_http_config(domain):
         default_type text/plain;
         try_files $uri =404;
     }}
-    location / {{ try_files $uri $uri/ /index.html; }}
+    location / {{ try_files /index.html =404; }}
 }}
 '''
 
@@ -254,7 +254,7 @@ server {{
     ssl_session_timeout 1d;
     root /var/www/remnanode-decoy/{domain};
     index index.html;
-    location / {{ try_files $uri $uri/ /index.html; }}
+    location / {{ try_files /index.html =404; }}
 }}
 '''
 
@@ -282,6 +282,9 @@ def issue_certificate(form):
         raise ValueError(f"DNS points to {', '.join(sorted(addresses)) or 'nothing'}, server IP is {public_ip}.")
     site_root = Path("/var/www/remnanode-decoy") / domain
     site_root.mkdir(parents=True, exist_ok=True)
+    # The manager runs with UMask=0077. Make the decoy document root
+    # traversable by the unprivileged nginx worker explicitly.
+    os.chmod(site_root, 0o755)
     atomic_write(site_root / "index.html", f'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Control center</title><style>body{{margin:0;background:#0b1320;color:#dce8f4;font:16px system-ui;display:grid;place-items:center;min-height:100vh}}main{{max-width:560px;padding:48px;border:1px solid #294156;background:#101d2c}}small{{color:#6fc9c2}}h1{{font-weight:650;letter-spacing:-.03em}}</style><main><small>SYSTEM ACCESS</small><h1>Administrative gateway</h1><p>The requested service is available to authorized operators.</p></main></html>''', 0o644)
     available = Path("/etc/nginx/sites-available") / f"rnm-{domain}.conf"
     enabled = Path("/etc/nginx/sites-enabled") / available.name
@@ -308,6 +311,8 @@ def issue_certificate(form):
             write_compose(config, "certificate-volume")
             run(["docker", "compose", "up", "-d"], cwd=COMPOSE_DIR, timeout=300)
             volume_note = " Certificate volume added to Compose."
+    elif form.get("cert_volume") == ["1"]:
+        volume_note = " Compose is not installed yet; keep the certificate-volume option enabled when applying it."
     containers = run(["docker", "ps", "-a", "--format", "{{.Names}}"], check=False).splitlines()
     if form.get("restart_node") == ["1"] and "remnanode" in containers:
         run(["docker", "restart", "remnanode"], timeout=120)
@@ -450,6 +455,7 @@ def render_login(error=""):
 
 def render_dashboard(message="", error=""):
     s = status_data()
+    compose_text = COMPOSE_FILE.read_text(encoding="utf-8") if COMPOSE_FILE.exists() else ""
     last = (STATE_DIR / "last-inbound.json").read_text(encoding="utf-8") if (STATE_DIR / "last-inbound.json").exists() else ""
     meta = json.loads((STATE_DIR / "last-meta.json").read_text()) if (STATE_DIR / "last-meta.json").exists() else {}
     certs = "".join(f'<span class="pill">{html.escape(x)}</span>' for x in s["certs"]) or '<span class="muted">Пока нет</span>'
@@ -460,11 +466,11 @@ def render_dashboard(message="", error=""):
 <section class="card"><div class="label">Runtime</div><h2>Состояние узла</h2><div class="metric"><span>RemnaNode</span><b class="{'ok' if s['state']=='running' else 'warn'}">{html.escape(s['state'])}</b></div><div class="metric"><span>Перезапуски</span><b>{html.escape(s['restarts'])}</b></div><div class="metric"><span>Docker</span><b>{html.escape(s['docker'])}</b></div><div class="metric"><span>Compose</span><b>{html.escape(s['compose'])}</b></div><div class="actions"><form method="post" action="{web_path('action')}"><input type="hidden" name="csrf" value="{csrf_token()}"><button name="action" value="start">Запустить</button><button class="secondary" name="action" value="restart">Перезапустить</button><button class="secondary" name="action" value="pull">Обновить</button></form></div></section>
 <section class="card"><div class="label">Kernel controls</div><h2>Сеть</h2><div class="metric"><span>Congestion</span><b class="ok">{html.escape(s['bbr'])}</b></div><div class="metric"><span>Queue</span><b>{html.escape(s['qdisc'])}</b></div><div class="metric"><span>Fast Open / MTU</span><b>{html.escape(s['fastopen'])} / {html.escape(s['mtu_probing'])}</b></div><form method="post" action="{web_path('network')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label class="check"><input type="checkbox" name="bbr" value="1" {'checked' if s['bbr']=='bbr' else ''}> BBR + fq</label><label class="check"><input type="checkbox" name="fastopen" value="1" {'checked' if s['fastopen']=='3' else ''}> TCP Fast Open</label><label class="check"><input type="checkbox" name="mtu" value="1" {'checked' if s['mtu_probing']=='1' else ''}> MTU probing</label><label class="check"><input type="checkbox" name="buffers" value="1" {'checked' if s['rmem_max']=='16777216' else ''}> VPN-буферы 16 MiB</label><label class="check"><input type="checkbox" name="backlog" value="1" {'checked' if s['backlog']=='8192' else ''}> Очереди 8192</label><button style="margin-top:16px">Применить переключатели</button></form><p class="muted">Снятый флажок возвращает значение, которое было до установки панели.</p></section>
 <section class="card"><div class="label">Certificates</div><h2>Хранилище TLS</h2><div class="certs">{certs}</div><p class="muted">Файлы копируются в каталог Xray и обновляются deploy-hook’ом Certbot.</p></section>
-<section class="card wide"><div class="label">01 / Node deployment</div><h2>Docker Compose RemnaNode</h2><form method="post" action="{web_path('compose')}"><input type="hidden" name="csrf" value="{csrf_token()}"><textarea name="compose" spellcheck="false" placeholder="Вставь полный docker-compose.yml из Remnawave"></textarea><div class="row"><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Добавить volume сертификатов</label><label class="check"><input type="checkbox" name="pull" value="1" checked> Скачать свежий образ</label></div><button>Проверить и запустить</button></form><p class="mono muted">Каталог: /opt/remnanode · SHA-256: {html.escape(s['compose_hash'])}. Перед заменой создаётся резервная копия.</p></section>
+<section class="card wide"><div class="label">01 / Node deployment</div><h2>Docker Compose RemnaNode</h2><form method="post" action="{web_path('compose')}"><input type="hidden" name="csrf" value="{csrf_token()}"><textarea id="compose-editor" name="compose" spellcheck="false" placeholder="Вставь полный docker-compose.yml из Remnawave">{html.escape(compose_text)}</textarea><div class="row"><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Добавить volume сертификатов</label><label class="check"><input type="checkbox" name="pull" value="1" checked> Скачать свежий образ</label></div><button>Проверить и запустить</button></form><p class="mono muted">Каталог: /opt/remnanode · SHA-256: {html.escape(s['compose_hash'])}. Перед заменой создаётся резервная копия.</p></section>
 <section class="card"><div class="label">02 / Certificate</div><h2>Выпустить сертификат</h2><form method="post" action="{web_path('cert')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label>Домен</label><input name="domain" placeholder="node.example.com" required><label>Email Let's Encrypt</label><input type="email" name="email" required><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Добавить volume в существующий Compose</label><label class="check"><input type="checkbox" name="restart_node" value="1" checked> Перезапустить ноду после выпуска</label><label class="check"><input type="checkbox" name="force_dns" value="1"> Игнорировать несовпадение DNS</label><button>Проверить DNS и выпустить</button></form></section>
 <section class="card full"><div class="label">03 / Profile builder</div><h2>Сгенерировать inbound</h2><form method="post" action="{web_path('inbound')}"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Тип</label><select name="kind"><option value="reality">VLESS TCP Reality + self-steal</option><option value="hysteria">Hysteria 2 TLS</option></select></div><div><label>Tag</label><input name="tag" value="VLESS_REALITY"></div><div><label>Порт</label><input type="number" min="1" max="65535" name="inbound_port" value="2053"></div><div><label>Домен</label><input name="inbound_domain" placeholder="node.example.com" required></div></div><button>Сгенерировать inbound</button></form>{inbound}</section>
 <section class="card full"><div class="label">Live tail</div><h2>Последние события RemnaNode</h2><pre>{html.escape(s['logs'] or 'Контейнер ещё не запускался.')}</pre></section>
-</main><footer>Node Forge backend: {html.escape(BIND)}:{PORT} · public route: {html.escape(BASE_PATH)}/ · <a class="muted" href="{web_path('logout')}">Выйти</a></footer></div><script>function copyInbound(){{navigator.clipboard.writeText(document.getElementById('inbound').innerText)}}</script></html>'''
+</main><footer>Node Forge backend: {html.escape(BIND)}:{PORT} · public route: {html.escape(BASE_PATH)}/ · <a class="muted" href="{web_path('logout')}">Выйти</a></footer></div><script>function copyInbound(){{navigator.clipboard.writeText(document.getElementById('inbound').innerText)}}const composeEditor=document.getElementById('compose-editor');if(composeEditor){{const saved=sessionStorage.getItem('node-forge-compose-draft');if(!composeEditor.value&&saved)composeEditor.value=saved;composeEditor.addEventListener('input',()=>sessionStorage.setItem('node-forge-compose-draft',composeEditor.value));}}</script></html>'''
 
 
 class Handler(BaseHTTPRequestHandler):
