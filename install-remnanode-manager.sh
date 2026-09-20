@@ -187,6 +187,7 @@ def csrf_token():
 
 
 def redact(text):
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
     text = re.sub(r'(?im)(SECRET_KEY\s*[=:]\s*)["\']?[^"\'\s]+', r'\1[hidden]', text)
     text = re.sub(r'(?i)(token=)[A-Za-z0-9_-]+', r'\1[hidden]', text)
     return text
