@@ -29,8 +29,9 @@ Password: generated-password
 
 ## Что умеет панель
 
-- принять полный `docker-compose.yml` из Remnawave и проверить его до замены;
-- создать `/opt/remnanode/docker-compose.yml`, скачать образ и запустить ноду;
+- принять полный `docker-compose.yml` из Remnawave, проверить и отдельно сохранить его;
+- получить актуальные теги `remnawave/node` из Docker Hub и выбрать нужную версию либо `latest`;
+- фоном скачать выбранный образ, запустить ноду и показать живой прогресс установки;
 - автоматически добавить read-only volume сертификатов Xray;
 - проверить DNS и выпустить сертификат Let's Encrypt;
 - положить `.pem` и `.key` в `/var/lib/remnawave/configs/xray/ssl`;
@@ -39,7 +40,8 @@ Password: generated-password
 - генерировать VLESS Reality self-steal и Hysteria 2 inbound;
 - независимо включать BBR, TCP Fast Open, MTU probing, VPN-буферы и очереди;
 - возвращать снятые сетевые настройки к значениям, сохранённым при установке;
-- показывать состояние контейнера, версии, перезапуски и последние логи;
+- показывать состояние контейнера, образ и перезапуски без перезагрузки страницы;
+- транслировать в браузер `docker logs -f` и `docker exec remnanode xlogs`;
 - создавать резервные копии Compose, Nginx и sysctl перед изменениями.
 
 Официальная последовательность Remnawave сохранена: Docker → каталог
