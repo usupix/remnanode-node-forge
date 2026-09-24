@@ -35,6 +35,7 @@ cat > /opt/remnanode-manager/app.py <<'PY'
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import os
 import re
@@ -95,6 +96,72 @@ def run(args, *, cwd=None, timeout=300, check=True):
     if check and result.returncode:
         raise RuntimeError(result.stdout.strip()[-4000:] or f"Command failed: {args[0]}")
     return result.stdout.strip()
+
+
+def normalize_ip(value):
+    try:
+        return str(ipaddress.ip_address(str(value).strip().split("%", 1)[0]))
+    except (TypeError, ValueError):
+        return ""
+
+
+def public_egress_ip(timeout=4):
+    try:
+        return normalize_ip(
+            urllib.request.urlopen("https://api.ipify.org", timeout=timeout).read().decode()
+        ) or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def server_addresses(include_public=True, public_ip=None):
+    entries = []
+    seen = set()
+    try:
+        interfaces = json.loads(run(
+            ["ip", "-j", "address", "show", "scope", "global"],
+            check=False, timeout=10,
+        ) or "[]")
+    except (json.JSONDecodeError, TypeError):
+        interfaces = []
+    for interface in interfaces:
+        name = str(interface.get("ifname") or "interface")
+        for address in interface.get("addr_info") or []:
+            value = normalize_ip(address.get("local", ""))
+            if not value or value in seen:
+                continue
+            parsed = ipaddress.ip_address(value)
+            if not parsed.is_global:
+                continue
+            seen.add(value)
+            entries.append({
+                "value": value,
+                "family": f"IPv{parsed.version}",
+                "source": name,
+            })
+    if include_public:
+        public_ip = normalize_ip(public_ip) if public_ip else public_egress_ip()
+        if public_ip and public_ip != "unknown" and public_ip not in seen:
+            parsed = ipaddress.ip_address(public_ip)
+            entries.append({
+                "value": public_ip,
+                "family": f"IPv{parsed.version}",
+                "source": "public egress / NAT",
+            })
+    return entries
+
+
+def resolve_domain_addresses(domain):
+    addresses = set()
+    try:
+        answers = socket.getaddrinfo(domain, 80, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"DNS lookup failed for {domain}: {exc}.") from exc
+    for answer in answers:
+        value = normalize_ip(answer[4][0])
+        if value:
+            addresses.add(value)
+    return sorted(addresses, key=lambda value: (ipaddress.ip_address(value).version, int(ipaddress.ip_address(value))))
 
 
 def atomic_write(path: Path, data: str, mode=0o600):
@@ -228,11 +295,7 @@ def status_data():
     mtu_probing = read_sysctl("net.ipv4.tcp_mtu_probing") or "unknown"
     rmem_max = read_sysctl("net.core.rmem_max") or "unknown"
     backlog = read_sysctl("net.core.netdev_max_backlog") or "unknown"
-    public_ip = "unknown"
-    try:
-        public_ip = urllib.request.urlopen("https://api.ipify.org", timeout=4).read().decode().strip()
-    except Exception:
-        pass
+    public_ip = public_egress_ip()
     compose_hash = "—"
     if COMPOSE_FILE.exists():
         compose_hash = hashlib.sha256(COMPOSE_FILE.read_bytes()).hexdigest()[:12]
@@ -446,14 +509,21 @@ def sync_certificate(domain):
 def issue_certificate(form):
     domain = form.get("domain", [""])[0].strip().lower().rstrip(".")
     email = form.get("email", [""])[0].strip()
+    selected_ip = normalize_ip(form.get("expected_ip", [""])[0])
     if not DOMAIN_RE.fullmatch(domain):
         raise ValueError("Enter a valid public domain name.")
     if "@" not in email or len(email) > 254:
         raise ValueError("Enter a valid email address.")
-    addresses = {row[4][0] for row in socket.getaddrinfo(domain, 80, type=socket.SOCK_STREAM)}
-    public_ip = urllib.request.urlopen("https://api.ipify.org", timeout=8).read().decode().strip()
-    if public_ip not in addresses and form.get("force_dns") != ["1"]:
-        raise ValueError(f"DNS points to {', '.join(sorted(addresses)) or 'nothing'}, server IP is {public_ip}.")
+    available_ips = {entry["value"] for entry in server_addresses()}
+    if not selected_ip:
+        raise ValueError("Choose the server IP address that the domain must resolve to.")
+    if selected_ip not in available_ips:
+        raise ValueError("The selected IP is no longer present on this server. Refresh the page and choose again.")
+    addresses = resolve_domain_addresses(domain)
+    dns_forced = form.get("force_dns") == ["1"]
+    if selected_ip not in addresses and not dns_forced:
+        resolved = ", ".join(addresses) or "nothing"
+        raise ValueError(f"DNS for {domain} points to {resolved}; selected server IP is {selected_ip}.")
     site_root = Path("/var/www/remnanode-decoy") / domain
     site_root.mkdir(parents=True, exist_ok=True)
     # The manager runs with UMask=0077. Make the decoy document root
@@ -490,7 +560,12 @@ def issue_certificate(form):
     containers = run(["docker", "ps", "-a", "--format", "{{.Names}}"], check=False).splitlines()
     if form.get("restart_node") == ["1"] and "remnanode" in containers:
         run(["docker", "restart", "remnanode"], timeout=120)
-    return f"Certificate issued: {SSL_DIR}/{domain}.pem and {domain}.key.{volume_note}"
+    dns_note = (
+        f" DNS matched selected server IP {selected_ip}."
+        if selected_ip in addresses else
+        f" DNS mismatch was explicitly ignored for selected server IP {selected_ip}."
+    )
+    return f"Certificate issued: {SSL_DIR}/{domain}.pem and {domain}.key.{dns_note}{volume_note}"
 
 
 def reality_keys():
@@ -630,6 +705,12 @@ def render_login(error=""):
 
 def render_dashboard(message="", error=""):
     s = status_data()
+    addresses = server_addresses(public_ip=s["public_ip"])
+    selected_address = s["public_ip"] if any(item["value"] == s["public_ip"] for item in addresses) else (addresses[0]["value"] if addresses else "")
+    address_options = "".join(
+        f'<option value="{html.escape(item["value"])}" {"selected" if item["value"] == selected_address else ""}>{html.escape(item["value"])} · {html.escape(item["source"])} · {item["family"]}</option>'
+        for item in addresses
+    ) or '<option value="">Адреса не найдены — обнови страницу</option>'
     compose_text = COMPOSE_FILE.read_text(encoding="utf-8") if COMPOSE_FILE.exists() else ""
     tags = image_tags()
     selected_tag = s["image"].rsplit(":", 1)[-1] if s["image"].startswith("remnawave/node:") else "latest"
@@ -649,7 +730,7 @@ def render_dashboard(message="", error=""):
 <section class="card"><div class="label">Kernel controls</div><h2>Сеть</h2><div class="metric"><span>Congestion</span><b class="ok">{html.escape(s['bbr'])}</b></div><div class="metric"><span>Queue</span><b>{html.escape(s['qdisc'])}</b></div><div class="metric"><span>Fast Open / MTU</span><b>{html.escape(s['fastopen'])} / {html.escape(s['mtu_probing'])}</b></div><form method="post" action="{web_path('network')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label class="check"><input type="checkbox" name="bbr" value="1" {'checked' if s['bbr']=='bbr' else ''}> BBR + fq</label><label class="check"><input type="checkbox" name="fastopen" value="1" {'checked' if s['fastopen']=='3' else ''}> TCP Fast Open</label><label class="check"><input type="checkbox" name="mtu" value="1" {'checked' if s['mtu_probing']=='1' else ''}> MTU probing</label><label class="check"><input type="checkbox" name="buffers" value="1" {'checked' if s['rmem_max']=='16777216' else ''}> VPN-буферы 16 MiB</label><label class="check"><input type="checkbox" name="backlog" value="1" {'checked' if s['backlog']=='8192' else ''}> Очереди 8192</label><button style="margin-top:16px">Применить переключатели</button></form><p class="muted">Снятый флажок возвращает значение, которое было до установки панели.</p></section>
 <section class="card"><div class="label">Certificates</div><h2>Хранилище TLS</h2><div class="certs">{certs}</div><p class="muted">Файлы копируются в каталог Xray и обновляются deploy-hook’ом Certbot.</p></section>
 <section class="card wide"><div class="label">01 / Configuration</div><h2>Сохранить Docker Compose</h2><form method="post" action="{web_path('compose')}"><input type="hidden" name="csrf" value="{csrf_token()}"><textarea id="compose-editor" name="compose" spellcheck="false" placeholder="Вставь полный docker-compose.yml из Remnawave">{html.escape(compose_text)}</textarea><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Подключить каталог сертификатов к контейнеру</label><button>Проверить и сохранить</button></form><p class="mono muted">Каталог: /opt/remnanode · SHA-256: {html.escape(s['compose_hash'])}. Сохранение ещё не запускает контейнер.</p></section>
-<section class="card"><div class="label">02 / Certificate · optional</div><h2>Выпустить сертификат</h2><form method="post" action="{web_path('cert')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label>Домен</label><input name="domain" placeholder="node.example.com" required><label>Email Let's Encrypt</label><input type="email" name="email" required><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Добавить volume в сохранённый Compose</label><label class="check"><input type="checkbox" name="restart_node" value="1"> Перезапустить уже работающую ноду</label><label class="check"><input type="checkbox" name="force_dns" value="1"> Игнорировать несовпадение DNS</label><button>Проверить DNS и выпустить</button></form></section>
+<section class="card"><div class="label">02 / Certificate · optional</div><h2>Выпустить сертификат</h2><form method="post" action="{web_path('cert')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label>Домен</label><input name="domain" placeholder="node.example.com" required><label>IP сервера для проверки DNS</label><select name="expected_ip" required>{address_options}</select><p class="muted">Выбранный адрес сравнивается с A/AAAA домена. Если записей несколько, для надёжного HTTP-01 каждый опубликованный адрес должен принимать запросы этого домена на порту 80.</p><label>Email Let's Encrypt</label><input type="email" name="email" required><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Добавить volume в сохранённый Compose</label><label class="check"><input type="checkbox" name="restart_node" value="1"> Перезапустить уже работающую ноду</label><label class="check"><input type="checkbox" name="force_dns" value="1"> Игнорировать несовпадение выбранного IP и DNS</label><button>Проверить DNS и выпустить</button></form></section>
 <section class="card full"><div class="label">03 / Installation</div><h2>Выбрать версию и установить</h2><form id="install-form" action="{web_path('api/install')}" method="post"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Версия образа</label><select name="version">{tag_options}</select></div><div style="align-self:end"><button id="install-button">Начать установку</button></div></div></form><div class="pipeline"><div class="stage"><small>01 Compose</small><b id="step-compose">{'готов' if COMPOSE_FILE.exists() else 'не сохранён'}</b></div><div class="stage"><small>02 Image</small><b id="step-image">{html.escape(job.get('tag') or selected_tag)}</b></div><div class="stage"><small>03 Deploy</small><b id="step-deploy">{html.escape(job.get('phase','idle'))}</b></div><div class="stage"><small>04 Runtime</small><b id="step-runtime">{html.escape(s['state'])}</b></div></div><p id="install-message" class="mono muted">{html.escape(job.get('message','Installation has not started.'))}</p><pre id="install-log">{html.escape(job.get('log','') or 'Здесь появится ход загрузки образа и запуска контейнера.')}</pre></section>
 <section class="card full"><div class="label">04 / Profile builder</div><h2>Сгенерировать inbound</h2><form method="post" action="{web_path('inbound')}"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Тип</label><select name="kind"><option value="reality">VLESS TCP Reality + self-steal</option><option value="hysteria">Hysteria 2 TLS</option></select></div><div><label>Tag</label><input name="tag" value="VLESS_REALITY"></div><div><label>Порт</label><input type="number" min="1" max="65535" name="inbound_port" value="2053"></div><div><label>Домен</label><input name="inbound_domain" placeholder="node.example.com" required></div></div><button>Сгенерировать inbound</button></form>{inbound}</section>
 <section class="card full"><div class="label">Live console</div><h2>Логи без обновления страницы</h2><div class="logbar"><div class="tabs"><button type="button" class="secondary active" data-stream="container">Docker logs</button><button type="button" class="secondary" data-stream="xray">Xray · xlogs</button><button type="button" class="secondary" id="clear-log">Очистить экран</button></div><span id="stream-state" class="stream-state">подключение…</span></div><div id="live-log" class="terminal">Подключаю поток логов…</div></section>
