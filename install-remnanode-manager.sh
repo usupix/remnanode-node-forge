@@ -714,7 +714,7 @@ def nginx_http_config(domain):
         default_type text/plain;
         try_files $uri =404;
     }}
-    location / {{ try_files /index.html =404; }}
+    location / {{ try_files $uri $uri/ =404; }}
 }}
 '''
 
@@ -731,9 +731,100 @@ server {{
     ssl_session_timeout 1d;
     root /var/www/remnanode-decoy/{domain};
     index index.html;
-    location / {{ try_files /index.html =404; }}
+    location / {{ try_files $uri $uri/ =404; }}
 }}
 '''
+
+
+def create_decoy_site(domain):
+    site_root = Path("/var/www/remnanode-decoy") / domain
+    site_root.mkdir(parents=True, exist_ok=True)
+    # The manager runs with UMask=0077. Nginx needs to traverse the directory
+    # and read the generated public assets explicitly.
+    os.chmod(site_root, 0o755)
+
+    brands = [
+        ("Northline", "Infrastructure services", "#55d6be", "#122a3a"),
+        ("LumaGrid", "Connected workspace", "#7bc6ff", "#16263f"),
+        ("Cedar Cloud", "Managed edge platform", "#9dd67d", "#183027"),
+        ("Harbor Stack", "Reliable application delivery", "#f2b66d", "#352719"),
+        ("Vertex Lane", "Distributed systems", "#b9a3ff", "#282044"),
+    ]
+    summaries = [
+        "Service availability and scheduled maintenance information.",
+        "A lightweight gateway for regional application services.",
+        "Operational status for the public delivery platform.",
+        "Connectivity, storage and API service overview.",
+    ]
+    locations = ["Central Europe", "Northern Europe", "European edge", "Regional network"]
+    brand, product, accent, panel = secrets.choice(brands)
+    summary = secrets.choice(summaries)
+    location = secrets.choice(locations)
+    deployment = secrets.token_hex(4).upper()
+    updated = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+    safe_domain = html.escape(domain)
+    safe_brand = html.escape(brand)
+    safe_product = html.escape(product)
+    safe_summary = html.escape(summary)
+    safe_location = html.escape(location)
+
+    page = f'''<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="{safe_summary}">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <title>{safe_brand} — Service status</title>
+  <style>
+    :root {{ color-scheme: dark; --accent:{accent}; --panel:{panel}; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; background:#09131d; color:#e8f1f7; font:15px/1.55 system-ui,-apple-system,Segoe UI,sans-serif; }}
+    header,main,footer {{ width:min(920px,calc(100% - 40px)); margin:auto; }}
+    header {{ display:flex; align-items:center; justify-content:space-between; padding:28px 0; border-bottom:1px solid #263746; }}
+    .brand {{ font-size:19px; font-weight:750; letter-spacing:-.02em; }}
+    .brand span,.muted {{ color:#91a8b8; }}
+    .pill {{ display:inline-flex; align-items:center; gap:8px; padding:7px 11px; border:1px solid #315061; border-radius:999px; color:#cfe4ec; }}
+    .dot {{ width:8px; height:8px; border-radius:50%; background:var(--accent); box-shadow:0 0 14px var(--accent); }}
+    main {{ padding:72px 0 64px; }}
+    h1 {{ max-width:680px; margin:0 0 16px; font-size:clamp(36px,7vw,64px); line-height:1.03; letter-spacing:-.055em; }}
+    .lead {{ max-width:620px; margin:0 0 38px; color:#a9becb; font-size:18px; }}
+    .grid {{ display:grid; grid-template-columns:repeat(3,1fr); gap:14px; }}
+    .card {{ padding:22px; border:1px solid #294253; border-radius:14px; background:linear-gradient(145deg,var(--panel),#0d1b27); }}
+    .card strong {{ display:block; margin-bottom:18px; font-size:16px; }}
+    .ok {{ color:var(--accent); font-weight:700; }}
+    footer {{ display:flex; justify-content:space-between; gap:20px; padding:24px 0 36px; border-top:1px solid #263746; color:#78909f; font-size:13px; }}
+    @media (max-width:680px) {{ .grid {{ grid-template-columns:1fr; }} header,footer {{ align-items:flex-start; flex-direction:column; }} main {{ padding-top:48px; }} }}
+  </style>
+</head>
+<body>
+  <header><div class="brand">{safe_brand} <span>/ {safe_product}</span></div><div class="pill"><i class="dot"></i>All systems operational</div></header>
+  <main>
+    <p class="muted">{safe_location} · {safe_domain}</p>
+    <h1>Services are operating normally.</h1>
+    <p class="lead">{safe_summary}</p>
+    <section class="grid" aria-label="Service health">
+      <article class="card"><strong>Edge gateway</strong><span class="ok">Operational</span></article>
+      <article class="card"><strong>Application API</strong><span class="ok">Operational</span></article>
+      <article class="card"><strong>Object storage</strong><span class="ok">Operational</span></article>
+    </section>
+  </main>
+  <footer><span>Last checked {updated}</span><span>Deployment {deployment}</span></footer>
+</body>
+</html>
+'''
+    favicon = f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="{panel}"/><path d="M17 42V22h8l7 10 7-10h8v20h-7V31l-8 11-8-11v11z" fill="{accent}"/></svg>'''
+    status = {
+        "status": "operational",
+        "region": location,
+        "updated": updated,
+        "deployment": deployment.lower(),
+    }
+    atomic_write(site_root / "index.html", page, 0o644)
+    atomic_write(site_root / "favicon.svg", favicon + "\n", 0o644)
+    atomic_write(site_root / "robots.txt", "User-agent: *\nAllow: /\n", 0o644)
+    atomic_write(site_root / "status.json", json.dumps(status, ensure_ascii=False, indent=2) + "\n", 0o644)
+    return site_root
 
 
 def sync_certificate(domain):
@@ -764,12 +855,7 @@ def issue_certificate(form):
     if selected_ip not in addresses and not dns_forced:
         resolved = ", ".join(addresses) or "nothing"
         raise ValueError(f"DNS for {domain} points to {resolved}; selected server IP is {selected_ip}.")
-    site_root = Path("/var/www/remnanode-decoy") / domain
-    site_root.mkdir(parents=True, exist_ok=True)
-    # The manager runs with UMask=0077. Make the decoy document root
-    # traversable by the unprivileged nginx worker explicitly.
-    os.chmod(site_root, 0o755)
-    atomic_write(site_root / "index.html", f'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Control center</title><style>body{{margin:0;background:#0b1320;color:#dce8f4;font:16px system-ui;display:grid;place-items:center;min-height:100vh}}main{{max-width:560px;padding:48px;border:1px solid #294156;background:#101d2c}}small{{color:#6fc9c2}}h1{{font-weight:650;letter-spacing:-.03em}}</style><main><small>SYSTEM ACCESS</small><h1>Administrative gateway</h1><p>The requested service is available to authorized operators.</p></main></html>''', 0o644)
+    create_decoy_site(domain)
     available = Path("/etc/nginx/sites-available") / f"rnm-{domain}.conf"
     enabled = Path("/etc/nginx/sites-enabled") / available.name
     backup([available], f"nginx-{domain}")
