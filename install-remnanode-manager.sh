@@ -70,6 +70,7 @@ INSTALL_STATE_FILE = STATE_DIR / "install-state.json"
 SSH_STATE_FILE = STATE_DIR / "ssh-state.json"
 SSH_MANAGED_CONFIG = Path("/etc/ssh/sshd_config.d/00-remnanode-manager.conf")
 SSH_SOCKET_OVERRIDE = Path("/etc/systemd/system/ssh.socket.d/90-remnanode-manager.conf")
+MANAGED_ROOT_AUTHORIZED_KEYS = STATE_DIR / "root-authorized_keys"
 ROOT_AUTHORIZED_KEYS = Path("/root/.ssh/authorized_keys")
 ADMIN_PASSWORD = os.environ["RNM_ADMIN_PASSWORD"]
 SESSION_SECRET = os.environ["RNM_SESSION_SECRET"].encode()
@@ -287,8 +288,8 @@ def backup_ssh_configuration(label):
         paths.append(SSH_MANAGED_CONFIG)
     if SSH_SOCKET_OVERRIDE.exists():
         paths.append(SSH_SOCKET_OVERRIDE)
-    if ROOT_AUTHORIZED_KEYS.exists():
-        paths.append(ROOT_AUTHORIZED_KEYS)
+    if MANAGED_ROOT_AUTHORIZED_KEYS.exists():
+        paths.append(MANAGED_ROOT_AUTHORIZED_KEYS)
     manifest = []
     for source in paths:
         relative = str(source).lstrip("/")
@@ -298,7 +299,7 @@ def backup_ssh_configuration(label):
         manifest.append(str(source))
     payload = {
         "files": manifest,
-        "managed": [str(SSH_MANAGED_CONFIG), str(SSH_SOCKET_OVERRIDE), str(ROOT_AUTHORIZED_KEYS)],
+        "managed": [str(SSH_MANAGED_CONFIG), str(SSH_SOCKET_OVERRIDE), str(MANAGED_ROOT_AUTHORIZED_KEYS)],
     }
     atomic_write(target / "manifest.json", json.dumps(payload, indent=2) + "\n", 0o600)
     return target
@@ -311,11 +312,12 @@ def restore_ssh_configuration(target):
         raise ValueError("SSH backup is missing or invalid.")
     payload = json.loads(manifest_file.read_text(encoding="utf-8"))
     manifest = payload.get("files", []) if isinstance(payload, dict) else payload
-    managed = payload.get("managed", []) if isinstance(payload, dict) else [str(SSH_MANAGED_CONFIG), str(SSH_SOCKET_OVERRIDE)]
-    for name in managed:
-        Path(name).unlink(missing_ok=True)
+    for destination in (SSH_MANAGED_CONFIG, SSH_SOCKET_OVERRIDE, MANAGED_ROOT_AUTHORIZED_KEYS):
+        destination.unlink(missing_ok=True)
     for name in manifest:
         destination = Path(name)
+        if destination == ROOT_AUTHORIZED_KEYS:
+            continue
         source = target / str(destination).lstrip("/")
         if not source.exists():
             raise RuntimeError(f"Backup file is missing: {source}")
@@ -345,13 +347,19 @@ def sshd_settings():
 
 
 def authorized_key_fingerprints():
-    if not ROOT_AUTHORIZED_KEYS.exists():
-        return []
-    output = run(["ssh-keygen", "-lf", str(ROOT_AUTHORIZED_KEYS)], check=False, timeout=20)
-    return [
-        line.strip() for line in output.splitlines()
-        if re.match(r"^\d+\s+(?:SHA256:|MD5:)", line.strip())
-    ]
+    fingerprints = []
+    for path in (MANAGED_ROOT_AUTHORIZED_KEYS, ROOT_AUTHORIZED_KEYS):
+        try:
+            if not path.exists():
+                continue
+        except OSError:
+            continue
+        output = run(["ssh-keygen", "-lf", str(path)], check=False, timeout=20)
+        fingerprints.extend(
+            line.strip() for line in output.splitlines()
+            if re.match(r"^\d+\s+(?:SHA256:|MD5:)", line.strip())
+        )
+    return list(dict.fromkeys(fingerprints))
 
 
 def local_port_ready(port):
@@ -381,6 +389,7 @@ def write_ssh_managed_config(ports, password_auth):
     body = "# Managed by RemnaNode Node Forge.\n"
     body += "".join(f"Port {port}\n" for port in unique_ports)
     body += "PubkeyAuthentication yes\n"
+    body += f"AuthorizedKeysFile {MANAGED_ROOT_AUTHORIZED_KEYS} .ssh/authorized_keys\n"
     body += f"PasswordAuthentication {auth}\n"
     body += f"KbdInteractiveAuthentication {auth}\n"
     body += f"PermitRootLogin {root_login}\n"
@@ -403,6 +412,9 @@ def verify_ssh_auth_settings(password_auth):
         mismatches.append(f"permitrootlogin={effective.get('permitrootlogin', 'missing')}")
     if effective.get("pubkeyauthentication") != "yes":
         mismatches.append(f"pubkeyauthentication={effective.get('pubkeyauthentication', 'missing')}")
+    authorized_files = effective.get("authorizedkeysfile", "").split()
+    if str(MANAGED_ROOT_AUTHORIZED_KEYS) not in authorized_files or ".ssh/authorized_keys" not in authorized_files:
+        mismatches.append(f"authorizedkeysfile={effective.get('authorizedkeysfile', 'missing')}")
     if mismatches:
         raise RuntimeError("OpenSSH ignored the requested authentication settings: " + ", ".join(mismatches))
 
@@ -442,17 +454,17 @@ def install_root_public_key(value):
     value = validate_public_key(value)
     if not value:
         return False
-    ROOT_AUTHORIZED_KEYS.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(ROOT_AUTHORIZED_KEYS.parent, 0o700)
-    current = ROOT_AUTHORIZED_KEYS.read_text(encoding="utf-8", errors="replace").splitlines() if ROOT_AUTHORIZED_KEYS.exists() else []
+    MANAGED_ROOT_AUTHORIZED_KEYS.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(MANAGED_ROOT_AUTHORIZED_KEYS.parent, 0o700)
+    current = MANAGED_ROOT_AUTHORIZED_KEYS.read_text(encoding="utf-8", errors="replace").splitlines() if MANAGED_ROOT_AUTHORIZED_KEYS.exists() else []
     identity = tuple(value.split()[:2])
     if any(tuple(line.strip().split()[:2]) == identity for line in current if line.strip() and not line.lstrip().startswith("#")):
         return False
-    with ROOT_AUTHORIZED_KEYS.open("a", encoding="utf-8") as handle:
+    with MANAGED_ROOT_AUTHORIZED_KEYS.open("a", encoding="utf-8") as handle:
         if current and current[-1].strip():
             handle.write("\n")
         handle.write(value + "\n")
-    os.chmod(ROOT_AUTHORIZED_KEYS, 0o600)
+    os.chmod(MANAGED_ROOT_AUTHORIZED_KEYS, 0o600)
     return True
 
 
@@ -1350,8 +1362,7 @@ Group=root
 UMask=0077
 NoNewPrivileges=false
 PrivateTmp=true
-# The manager explicitly installs and backs up root's authorized_keys.
-ProtectHome=false
+ProtectHome=true
 ProtectSystem=false
 
 [Install]

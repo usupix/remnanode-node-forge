@@ -58,6 +58,11 @@ Password: generated-password
 новый порт параллельно текущему. Откройте вторую SSH-сессию на новом порту и
 только после успешного входа введите номер порта в поле подтверждения.
 
+Добавленный ключ хранится в защищённом файле
+`/var/lib/remnanode-manager/root-authorized_keys`. OpenSSH проверяет и его, и
+обычный `/root/.ssh/authorized_keys`, поэтому существующие ключи не заменяются,
+а веб-службе не требуется доступ на запись в домашний каталог root.
+
 Если снять флажок парольного входа, Node Forge выставит
 `PasswordAuthentication no`, `KbdInteractiveAuthentication no` и
 `PermitRootLogin prohibit-password`. Это разрешено только когда у root уже есть
