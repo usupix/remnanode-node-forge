@@ -8,7 +8,7 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends python3 python3-yaml nginx certbot openssl ca-certificates curl
+apt-get install -y --no-install-recommends python3 python3-yaml nginx certbot openssh-server openssl ca-certificates curl
 
 # Remnawave's official node guide uses get.docker.com. Download first so a
 # failed transfer can never be piped into a privileged shell.
@@ -43,6 +43,7 @@ import secrets
 import selectors
 import shutil
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -65,6 +66,10 @@ SYSCTL_BBR = Path("/etc/sysctl.d/99-vpn-bbr.conf")
 SYSCTL_TUNE = Path("/etc/sysctl.d/99-remnanode-manager-network.conf")
 NETWORK_BASELINE = STATE_DIR / "network-baseline.json"
 INSTALL_STATE_FILE = STATE_DIR / "install-state.json"
+SSH_STATE_FILE = STATE_DIR / "ssh-state.json"
+SSH_MANAGED_CONFIG = Path("/etc/ssh/sshd_config.d/00-remnanode-manager.conf")
+SSH_SOCKET_OVERRIDE = Path("/etc/systemd/system/ssh.socket.d/90-remnanode-manager.conf")
+ROOT_AUTHORIZED_KEYS = Path("/root/.ssh/authorized_keys")
 ADMIN_PASSWORD = os.environ["RNM_ADMIN_PASSWORD"]
 SESSION_SECRET = os.environ["RNM_SESSION_SECRET"].encode()
 BIND = os.getenv("RNM_BIND", "127.0.0.1")
@@ -72,6 +77,7 @@ PORT = int(os.getenv("RNM_PORT", "8765"))
 BASE_PATH = "/" + os.environ["RNM_BASE_PATH"].strip("/")
 DOMAIN_RE = re.compile(r"(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 TAG_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}$")
+SSH_KEY_RE = re.compile(r"^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)\s+([A-Za-z0-9+/]+={0,3})(?:\s+.*)?$")
 attempts = {}
 install_guard = threading.Lock()
 install_state_guard = threading.Lock()
@@ -229,6 +235,215 @@ def backup(paths, label):
     return target
 
 
+def command_ok(args, timeout=20):
+    try:
+        return subprocess.run(
+            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=timeout, check=False,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def load_ssh_state():
+    if not SSH_STATE_FILE.exists():
+        return {}
+    try:
+        value = json.loads(SSH_STATE_FILE.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_ssh_state(value):
+    atomic_write(SSH_STATE_FILE, json.dumps(value, ensure_ascii=False, indent=2) + "\n", 0o600)
+
+
+def ssh_config_files():
+    files = [Path("/etc/ssh/sshd_config")]
+    dropin = Path("/etc/ssh/sshd_config.d")
+    if dropin.exists():
+        files.extend(sorted(dropin.glob("*.conf")))
+    return [path for path in files if path.exists() and path != SSH_MANAGED_CONFIG]
+
+
+def backup_ssh_configuration(label):
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(2)
+    target = BACKUP_DIR / f"{stamp}-{label}"
+    target.mkdir(parents=True, exist_ok=False)
+    os.chmod(target, 0o700)
+    paths = ssh_config_files()
+    if SSH_MANAGED_CONFIG.exists():
+        paths.append(SSH_MANAGED_CONFIG)
+    if SSH_SOCKET_OVERRIDE.exists():
+        paths.append(SSH_SOCKET_OVERRIDE)
+    if ROOT_AUTHORIZED_KEYS.exists():
+        paths.append(ROOT_AUTHORIZED_KEYS)
+    manifest = []
+    for source in paths:
+        relative = str(source).lstrip("/")
+        destination = target / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        manifest.append(str(source))
+    payload = {
+        "files": manifest,
+        "managed": [str(SSH_MANAGED_CONFIG), str(SSH_SOCKET_OVERRIDE), str(ROOT_AUTHORIZED_KEYS)],
+    }
+    atomic_write(target / "manifest.json", json.dumps(payload, indent=2) + "\n", 0o600)
+    return target
+
+
+def restore_ssh_configuration(target):
+    target = Path(target)
+    manifest_file = target / "manifest.json"
+    if not manifest_file.exists() or BACKUP_DIR not in target.parents:
+        raise ValueError("SSH backup is missing or invalid.")
+    payload = json.loads(manifest_file.read_text(encoding="utf-8"))
+    manifest = payload.get("files", []) if isinstance(payload, dict) else payload
+    managed = payload.get("managed", []) if isinstance(payload, dict) else [str(SSH_MANAGED_CONFIG), str(SSH_SOCKET_OVERRIDE)]
+    for name in managed:
+        Path(name).unlink(missing_ok=True)
+    for name in manifest:
+        destination = Path(name)
+        source = target / str(destination).lstrip("/")
+        if not source.exists():
+            raise RuntimeError(f"Backup file is missing: {source}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+
+def sshd_settings():
+    output = run([
+        "sshd", "-T", "-C", "user=root,host=localhost,addr=127.0.0.1",
+    ], check=False, timeout=20)
+    values = {}
+    ports = []
+    for line in output.splitlines():
+        key, _, value = line.partition(" ")
+        key = key.strip().lower()
+        value = value.strip()
+        if not key:
+            continue
+        if key == "port" and value.isdigit():
+            ports.append(int(value))
+        elif key not in values:
+            values[key] = value
+    values["ports"] = sorted(set(ports)) or [22]
+    return values
+
+
+def authorized_key_fingerprints():
+    if not ROOT_AUTHORIZED_KEYS.exists():
+        return []
+    output = run(["ssh-keygen", "-lf", str(ROOT_AUTHORIZED_KEYS)], check=False, timeout=20)
+    return [
+        line.strip() for line in output.splitlines()
+        if re.match(r"^\d+\s+(?:SHA256:|MD5:)", line.strip())
+    ]
+
+
+def local_port_ready(port):
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+def ssh_socket_available():
+    return command_ok(["systemctl", "cat", "ssh.socket"])
+
+
+def ssh_service_name():
+    if command_ok(["systemctl", "cat", "ssh.service"]):
+        return "ssh.service"
+    return "sshd.service"
+
+
+def write_ssh_managed_config(ports, password_auth):
+    unique_ports = sorted({int(port) for port in ports})
+    if not unique_ports or any(not 1 <= port <= 65535 for port in unique_ports):
+        raise ValueError("SSH port must be between 1 and 65535.")
+    auth = "yes" if password_auth else "no"
+    root_login = "yes" if password_auth else "prohibit-password"
+    body = "# Managed by RemnaNode Node Forge.\n"
+    body += "".join(f"Port {port}\n" for port in unique_ports)
+    body += "PubkeyAuthentication yes\n"
+    body += f"PasswordAuthentication {auth}\n"
+    body += f"KbdInteractiveAuthentication {auth}\n"
+    body += f"PermitRootLogin {root_login}\n"
+    atomic_write(SSH_MANAGED_CONFIG, body, 0o600)
+    if ssh_socket_available():
+        socket_body = "[Socket]\nListenStream=\n"
+        socket_body += "".join(f"ListenStream={port}\n" for port in unique_ports)
+        atomic_write(SSH_SOCKET_OVERRIDE, socket_body, 0o644)
+
+
+def verify_ssh_auth_settings(password_auth):
+    effective = sshd_settings()
+    expected = "yes" if password_auth else "no"
+    expected_root = "yes" if password_auth else "prohibit-password"
+    mismatches = []
+    for key in ("passwordauthentication", "kbdinteractiveauthentication"):
+        if effective.get(key) != expected:
+            mismatches.append(f"{key}={effective.get(key, 'missing')}")
+    if effective.get("permitrootlogin") != expected_root:
+        mismatches.append(f"permitrootlogin={effective.get('permitrootlogin', 'missing')}")
+    if effective.get("pubkeyauthentication") != "yes":
+        mismatches.append(f"pubkeyauthentication={effective.get('pubkeyauthentication', 'missing')}")
+    if mismatches:
+        raise RuntimeError("OpenSSH ignored the requested authentication settings: " + ", ".join(mismatches))
+
+
+def reload_ssh_stack():
+    run(["sshd", "-t"], timeout=20)
+    run(["systemctl", "daemon-reload"], timeout=30)
+    if ssh_socket_available() and (
+        command_ok(["systemctl", "is-active", "--quiet", "ssh.socket"])
+        or command_ok(["systemctl", "is-enabled", "--quiet", "ssh.socket"])
+    ):
+        run(["systemctl", "restart", "ssh.socket"], timeout=30)
+    else:
+        service = ssh_service_name()
+        if not command_ok(["systemctl", "reload", service]):
+            run(["systemctl", "restart", service], timeout=30)
+
+
+def validate_public_key(value):
+    value = " ".join(value.strip().split())
+    if not value:
+        return ""
+    if len(value) > 16384 or not SSH_KEY_RE.fullmatch(value):
+        raise ValueError("Paste one complete OpenSSH public key, for example ssh-ed25519 AAAA... comment.")
+    probe = Path("/run") / f"node-forge-key-{secrets.token_hex(6)}"
+    try:
+        atomic_write(probe, value + "\n", 0o600)
+        if not command_ok(["ssh-keygen", "-lf", str(probe)]):
+            raise ValueError("ssh-keygen rejected this public key.")
+    finally:
+        probe.unlink(missing_ok=True)
+    return value
+
+
+def install_root_public_key(value):
+    value = validate_public_key(value)
+    if not value:
+        return False
+    ROOT_AUTHORIZED_KEYS.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(ROOT_AUTHORIZED_KEYS.parent, 0o700)
+    current = ROOT_AUTHORIZED_KEYS.read_text(encoding="utf-8", errors="replace").splitlines() if ROOT_AUTHORIZED_KEYS.exists() else []
+    identity = tuple(value.split()[:2])
+    if any(tuple(line.strip().split()[:2]) == identity for line in current if line.strip() and not line.lstrip().startswith("#")):
+        return False
+    with ROOT_AUTHORIZED_KEYS.open("a", encoding="utf-8") as handle:
+        if current and current[-1].strip():
+            handle.write("\n")
+        handle.write(value + "\n")
+    os.chmod(ROOT_AUTHORIZED_KEYS, 0o600)
+    return True
+
+
 def read_sysctl(key):
     return run(["sysctl", "-n", key], check=False, timeout=10).strip()
 
@@ -306,6 +521,7 @@ def status_data():
         "fastopen": fastopen, "mtu_probing": mtu_probing, "rmem_max": rmem_max,
         "backlog": backlog,
         "public_ip": public_ip, "compose_hash": compose_hash, "certs": certs,
+        "ssh": ssh_status(),
     }
 
 
@@ -678,6 +894,169 @@ def apply_network(form):
     return f"Network settings applied: {', '.join(enabled) or 'baseline restored'}. Backup: {saved}"
 
 
+def ssh_socket_ports():
+    if not ssh_socket_available():
+        return []
+    output = run(
+        ["systemctl", "show", "ssh.socket", "--property=Listen", "--value"],
+        check=False, timeout=20,
+    )
+    ports = []
+    for line in output.splitlines():
+        match = re.search(r"(?::|^)(\d{1,5})(?:\s+|$)", line.strip())
+        if match and 1 <= int(match.group(1)) <= 65535:
+            ports.append(int(match.group(1)))
+    return sorted(set(ports))
+
+
+def current_ssh_ports():
+    state = load_ssh_state()
+    ports = set(sshd_settings().get("ports", []))
+    ports.update(ssh_socket_ports())
+    ports.update(int(port) for port in state.get("active_ports", []) if str(port).isdigit())
+    return sorted(port for port in ports if 1 <= port <= 65535)
+
+
+def ssh_status():
+    settings = sshd_settings()
+    state = load_ssh_state()
+    fingerprints = authorized_key_fingerprints()
+    return {
+        "ports": current_ssh_ports(),
+        "password_auth": settings.get("passwordauthentication", "unknown"),
+        "kbd_auth": settings.get("kbdinteractiveauthentication", "unknown"),
+        "root_login": settings.get("permitrootlogin", "unknown"),
+        "key_count": len(fingerprints),
+        "fingerprints": fingerprints[:4],
+        "phase": state.get("phase", "unmanaged"),
+        "desired_port": state.get("desired_port", ""),
+        "backup": state.get("backup", ""),
+    }
+
+
+def port_in_use_by_other_service(port, allowed_ports):
+    output = run(["ss", "-H", "-ltnp", f"sport = :{port}"], check=False, timeout=20)
+    if not output:
+        return False
+    if port in allowed_ports:
+        return False
+    return "sshd" not in output.lower() and "ssh.socket" not in output.lower()
+
+
+def disable_other_port_directives():
+    changed = []
+    visited = set()
+    for config in ssh_config_files():
+        target = config.resolve() if config.is_symlink() else config
+        if target in visited or target == SSH_MANAGED_CONFIG or not target.exists():
+            continue
+        visited.add(target)
+        original = target.read_text(encoding="utf-8", errors="replace")
+        lines = []
+        updated = False
+        for line in original.splitlines(keepends=True):
+            if re.match(r"^[ \t]*Port[ \t]+\d{1,5}(?:[ \t]*(?:#.*)?)?(?:\r?\n)?$", line, re.IGNORECASE):
+                newline = "\n" if line.endswith("\n") else ""
+                lines.append("# Node Forge disabled previous: " + line.rstrip("\r\n") + newline)
+                updated = True
+            else:
+                lines.append(line)
+        if updated:
+            mode = stat.S_IMODE(target.stat().st_mode)
+            atomic_write(target, "".join(lines), mode)
+            changed.append(str(config))
+    return changed
+
+
+def apply_ssh_access(form):
+    try:
+        desired_port = int(form.get("ssh_port", [""])[0])
+    except ValueError as exc:
+        raise ValueError("Enter a valid SSH port.") from exc
+    if not 1 <= desired_port <= 65535:
+        raise ValueError("SSH port must be between 1 and 65535.")
+    if desired_port in {PORT, 80, 443}:
+        raise ValueError(f"Port {desired_port} is reserved by the manager or web services.")
+    password_auth = form.get("password_auth") == ["1"]
+    public_key = form.get("public_key", [""])[0]
+    active_ports = current_ssh_ports()
+    if port_in_use_by_other_service(desired_port, active_ports):
+        raise ValueError(f"Port {desired_port} is already occupied by another service.")
+    saved = backup_ssh_configuration("ssh-stage")
+    try:
+        key_added = install_root_public_key(public_key)
+        if not password_auth and not authorized_key_fingerprints():
+            raise ValueError("Password login cannot be disabled until at least one valid root public key is installed.")
+        staged_ports = sorted(set(active_ports + [desired_port]))
+        write_ssh_managed_config(staged_ports, password_auth)
+        reload_ssh_stack()
+        verify_ssh_auth_settings(password_auth)
+        if not local_port_ready(desired_port):
+            raise RuntimeError(f"SSH did not start listening on port {desired_port}.")
+        state = {
+            "phase": "staged",
+            "desired_port": desired_port,
+            "active_ports": staged_ports,
+            "password_auth": password_auth,
+            "backup": str(saved),
+            "updated": int(time.time()),
+        }
+        save_ssh_state(state)
+    except Exception:
+        restore_ssh_configuration(saved)
+        reload_ssh_stack()
+        raise
+    key_note = " Public key added." if key_added else " Public key was already installed or left unchanged."
+    password_note = "enabled" if password_auth else "disabled"
+    return f"SSH staged on ports {', '.join(map(str, staged_ports))}; password login is {password_note}.{key_note} Test port {desired_port}, then finalize it below. Backup: {saved}"
+
+
+def finalize_ssh_access(form):
+    state = load_ssh_state()
+    if state.get("phase") != "staged":
+        raise ValueError("There is no staged SSH port to finalize.")
+    desired_port = int(state["desired_port"])
+    confirm = form.get("confirm_port", [""])[0].strip()
+    if confirm != str(desired_port):
+        raise ValueError(f"Type {desired_port} to confirm that the new SSH port was tested.")
+    password_auth = bool(state.get("password_auth"))
+    if not password_auth and not authorized_key_fingerprints():
+        raise ValueError("No valid root public key was found; refusing to disable the old port.")
+    if not local_port_ready(desired_port):
+        raise RuntimeError(f"Port {desired_port} is not accepting connections; the old port was kept.")
+    saved = backup_ssh_configuration("ssh-finalize")
+    try:
+        changed = disable_other_port_directives()
+        write_ssh_managed_config([desired_port], password_auth)
+        reload_ssh_stack()
+        verify_ssh_auth_settings(password_auth)
+        if not local_port_ready(desired_port):
+            raise RuntimeError(f"SSH stopped listening on port {desired_port} after finalization.")
+        state.update({
+            "phase": "finalized", "active_ports": [desired_port],
+            "finalize_backup": str(saved), "updated": int(time.time()),
+        })
+        save_ssh_state(state)
+    except Exception:
+        restore_ssh_configuration(saved)
+        reload_ssh_stack()
+        raise
+    files_note = f" Disabled old Port directives in {len(changed)} file(s)." if changed else ""
+    return f"SSH finalized on port {desired_port}.{files_note} Password login is {'enabled' if password_auth else 'disabled'}."
+
+
+def rollback_ssh_access():
+    state = load_ssh_state()
+    backup_path = state.get("backup")
+    if not backup_path:
+        raise ValueError("No SSH backup is recorded for rollback.")
+    restore_ssh_configuration(backup_path)
+    reload_ssh_stack()
+    state.update({"phase": "rolled_back", "updated": int(time.time())})
+    save_ssh_state(state)
+    return f"SSH configuration restored from {backup_path}."
+
+
 def node_action(form):
     action = form.get("action", [""])[0]
     if action == "restart":
@@ -694,7 +1073,7 @@ def node_action(form):
 
 
 CSS = r'''
-:root{--ink:#07111d;--panel:#0d1d2b;--panel2:#112638;--line:#274359;--text:#dceaf5;--muted:#88a4b8;--cyan:#55d6cf;--amber:#ffb65c;--red:#ff6d78;--mono:ui-monospace,SFMono-Regular,Consolas,monospace;--sans:"Segoe UI Variable",Tahoma,sans-serif}*{box-sizing:border-box}body{margin:0;background:var(--ink);color:var(--text);font:15px/1.5 var(--sans);min-height:100vh}body:before{content:"";position:fixed;inset:0;background:linear-gradient(90deg,transparent 49.8%,rgba(85,214,207,.035) 50%,transparent 50.2%),linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px);background-size:180px 100%,100% 36px;pointer-events:none}.shell{max-width:1220px;margin:auto;padding:28px 24px 80px}.mast{display:grid;grid-template-columns:1fr auto;gap:20px;align-items:end;border-bottom:1px solid var(--line);padding-bottom:22px;margin-bottom:24px}.eyebrow,.label{font:700 11px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--cyan)}h1{font-size:clamp(34px,7vw,70px);line-height:.92;letter-spacing:-.055em;margin:10px 0 0;max-width:760px}.rail{display:flex;gap:8px;align-items:center;font-family:var(--mono);font-size:12px;color:var(--muted)}.pulse{width:10px;height:10px;border-radius:50%;background:var(--cyan);box-shadow:0 0 0 6px rgba(85,214,207,.08)}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{grid-column:span 4;background:rgba(13,29,43,.93);border:1px solid var(--line);padding:20px;min-width:0}.card.wide{grid-column:span 8}.card.full{grid-column:1/-1}.card h2{font-size:19px;margin:8px 0 16px;letter-spacing:-.02em}.metric{display:flex;justify-content:space-between;gap:16px;padding:9px 0;border-top:1px solid rgba(39,67,89,.65)}.metric b,.mono,code,pre{font-family:var(--mono)}.ok{color:var(--cyan)}.warn{color:var(--amber)}.error{color:var(--red)}label{display:block;margin:12px 0 6px;color:var(--muted);font-size:13px}input,select,textarea{width:100%;background:#07131f;color:var(--text);border:1px solid #31516a;padding:11px 12px;border-radius:2px;font:14px var(--mono);outline:none}input:focus,select:focus,textarea:focus{border-color:var(--cyan);box-shadow:0 0 0 3px rgba(85,214,207,.09)}textarea{min-height:220px;resize:vertical}.row{display:flex;gap:10px;flex-wrap:wrap}.row>*{flex:1 1 180px}.check{display:flex;gap:9px;align-items:center;color:var(--text)}.check input{width:auto}button,.button{background:var(--cyan);color:#061218;border:0;padding:11px 15px;font-weight:750;cursor:pointer;text-decoration:none;display:inline-block}.secondary{background:#173149;color:var(--text);border:1px solid #31516a}.danger{background:var(--red)}button:hover{filter:brightness(1.08)}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}.flash{border-left:4px solid var(--cyan);background:#102a31;padding:12px 15px;margin-bottom:14px}.flash.error{border-color:var(--red);background:#2b1720}.certs{display:flex;gap:7px;flex-wrap:wrap}.pill{font:12px var(--mono);border:1px solid var(--line);padding:5px 8px;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#050c13;border:1px solid #20394e;padding:14px;max-height:360px;overflow:auto;color:#b9d3e5}.copybox{position:relative}.copybox button{position:absolute;right:8px;top:8px;padding:6px 9px}.muted{color:var(--muted)}footer{margin-top:26px;color:var(--muted);font:12px var(--mono)}@media(max-width:850px){.card,.card.wide{grid-column:1/-1}.mast{grid-template-columns:1fr}.rail{justify-content:flex-start}}@media(prefers-reduced-motion:no-preference){.pulse{animation:pulse 2.2s infinite}@keyframes pulse{50%{box-shadow:0 0 0 12px rgba(85,214,207,0)}}}
+:root{--ink:#07111d;--panel:#0d1d2b;--panel2:#112638;--line:#274359;--text:#dceaf5;--muted:#88a4b8;--cyan:#55d6cf;--amber:#ffb65c;--red:#ff6d78;--mono:ui-monospace,SFMono-Regular,Consolas,monospace;--sans:"Segoe UI Variable",Tahoma,sans-serif}*{box-sizing:border-box}body{margin:0;background:var(--ink);color:var(--text);font:15px/1.5 var(--sans);min-height:100vh}body:before{content:"";position:fixed;inset:0;background:linear-gradient(90deg,transparent 49.8%,rgba(85,214,207,.035) 50%,transparent 50.2%),linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px);background-size:180px 100%,100% 36px;pointer-events:none}.shell{max-width:1220px;margin:auto;padding:28px 24px 80px}.mast{display:grid;grid-template-columns:1fr auto;gap:20px;align-items:end;border-bottom:1px solid var(--line);padding-bottom:22px;margin-bottom:24px}.eyebrow,.label{font:700 11px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--cyan)}h1{font-size:clamp(34px,7vw,70px);line-height:.92;letter-spacing:-.055em;margin:10px 0 0;max-width:760px}.rail{display:flex;gap:8px;align-items:center;font-family:var(--mono);font-size:12px;color:var(--muted)}.pulse{width:10px;height:10px;border-radius:50%;background:var(--cyan);box-shadow:0 0 0 6px rgba(85,214,207,.08)}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{grid-column:span 4;background:rgba(13,29,43,.93);border:1px solid var(--line);padding:20px;min-width:0}.card.wide{grid-column:span 8}.card.full{grid-column:1/-1}.card h2{font-size:19px;margin:8px 0 16px;letter-spacing:-.02em}.metric{display:flex;justify-content:space-between;gap:16px;padding:9px 0;border-top:1px solid rgba(39,67,89,.65)}.metric b,.mono,code,pre{font-family:var(--mono)}.ok{color:var(--cyan)}.warn{color:var(--amber)}.error{color:var(--red)}label{display:block;margin:12px 0 6px;color:var(--muted);font-size:13px}input,select,textarea{width:100%;background:#07131f;color:var(--text);border:1px solid #31516a;padding:11px 12px;border-radius:2px;font:14px var(--mono);outline:none}input:focus,select:focus,textarea:focus{border-color:var(--cyan);box-shadow:0 0 0 3px rgba(85,214,207,.09)}textarea{min-height:220px;resize:vertical}.ssh-key{min-height:105px}.ssh-password{margin-top:36px}.ssh-confirm{margin-top:18px;padding:15px;border:1px solid rgba(255,182,92,.55);background:#231b12}.row{display:flex;gap:10px;flex-wrap:wrap}.row>*{flex:1 1 180px}.check{display:flex;gap:9px;align-items:center;color:var(--text)}.check input{width:auto}button,.button{background:var(--cyan);color:#061218;border:0;padding:11px 15px;font-weight:750;cursor:pointer;text-decoration:none;display:inline-block}.secondary{background:#173149;color:var(--text);border:1px solid #31516a}.danger{background:var(--red)}button:hover{filter:brightness(1.08)}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}.flash{border-left:4px solid var(--cyan);background:#102a31;padding:12px 15px;margin-bottom:14px}.flash.error{border-color:var(--red);background:#2b1720}.certs{display:flex;gap:7px;flex-wrap:wrap}.pill{font:12px var(--mono);border:1px solid var(--line);padding:5px 8px;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#050c13;border:1px solid #20394e;padding:14px;max-height:360px;overflow:auto;color:#b9d3e5}.copybox{position:relative}.copybox button{position:absolute;right:8px;top:8px;padding:6px 9px}.muted{color:var(--muted)}footer{margin-top:26px;color:var(--muted);font:12px var(--mono)}@media(max-width:850px){.card,.card.wide{grid-column:1/-1}.mast{grid-template-columns:1fr}.rail{justify-content:flex-start}}@media(prefers-reduced-motion:no-preference){.pulse{animation:pulse 2.2s infinite}@keyframes pulse{50%{box-shadow:0 0 0 12px rgba(85,214,207,0)}}}
 .pipeline{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin:16px 0}.stage{background:#091621;padding:12px;min-height:76px}.stage small{display:block;color:var(--muted);font:10px var(--mono);text-transform:uppercase;letter-spacing:.1em}.stage b{display:block;margin-top:7px;font:13px var(--mono)}.terminal{min-height:330px;max-height:520px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#03090e;color:#b9d3e5;border:1px solid #20394e;padding:14px;font:12px/1.55 var(--mono)}.logbar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:10px 0}.tabs{display:flex;gap:7px;flex-wrap:wrap}.tabs button.active{background:var(--amber);color:#1d1307}.stream-state{font:11px var(--mono);color:var(--muted)}.stream-state.live{color:var(--cyan)}.spinner{display:inline-block;width:9px;height:9px;border:2px solid rgba(85,214,207,.25);border-top-color:var(--cyan);border-radius:50%;margin-right:7px;vertical-align:-1px;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:850px){.pipeline{grid-template-columns:1fr 1fr}}@media(prefers-reduced-motion:reduce){.spinner{animation:none}}
 '''
 
@@ -722,6 +1101,15 @@ def render_dashboard(message="", error=""):
     last = (STATE_DIR / "last-inbound.json").read_text(encoding="utf-8") if (STATE_DIR / "last-inbound.json").exists() else ""
     meta = json.loads((STATE_DIR / "last-meta.json").read_text()) if (STATE_DIR / "last-meta.json").exists() else {}
     certs = "".join(f'<span class="pill">{html.escape(x)}</span>' for x in s["certs"]) or '<span class="muted">Пока нет</span>'
+    ssh = s["ssh"]
+    ssh_ports = ", ".join(map(str, ssh["ports"])) or "unknown"
+    ssh_port_value = ssh["desired_port"] or (ssh["ports"][0] if ssh["ports"] else 22)
+    ssh_keys = "<br>".join(html.escape(item) for item in ssh["fingerprints"]) or "Ключи root пока не найдены"
+    ssh_password_on = ssh["root_login"] == "yes" and (ssh["password_auth"] == "yes" or ssh["kbd_auth"] == "yes")
+    ssh_finalize = ""
+    if ssh["phase"] == "staged":
+        ssh_finalize = f'''<div class="ssh-confirm"><p class="warn"><b>Сначала открой вторую SSH-сессию на порту {ssh_port_value}.</b> Старые порты пока оставлены специально.</p><form method="post" action="{web_path('ssh-finalize')}" onsubmit="return confirm('Оставить только новый SSH-порт?')"><input type="hidden" name="csrf" value="{csrf_token()}"><label>Для подтверждения введи новый порт</label><div class="row"><input name="confirm_port" inputmode="numeric" placeholder="{ssh_port_value}" required><button class="danger">Оставить только {ssh_port_value}</button></div></form></div>'''
+    ssh_rollback = f'''<form method="post" action="{web_path('ssh-rollback')}" onsubmit="return confirm('Вернуть SSH-настройки из резервной копии?')"><input type="hidden" name="csrf" value="{csrf_token()}"><button class="secondary">Откатить SSH</button></form>''' if ssh["backup"] else ""
     flash = f'<div class="flash">{html.escape(message)}</div>' if message else ""
     flash += f'<div class="flash error">{html.escape(error)}</div>' if error else ""
     inbound = f'''<div class="copybox"><button class="secondary" onclick="copyInbound();return false">Копировать</button><pre id="inbound">{html.escape(last)}</pre></div><p class="mono muted">Public key: {html.escape(meta.get('publicKey','—'))} · Short ID: {html.escape(meta.get('shortId','—'))}</p>''' if last else '<p class="muted">Сгенерированный inbound появится здесь.</p>'
@@ -729,6 +1117,7 @@ def render_dashboard(message="", error=""):
 <section class="card"><div class="label">Runtime</div><h2>Состояние узла</h2><div class="metric"><span>RemnaNode</span><b id="node-state" class="{'ok' if s['state']=='running' else 'warn'}">{html.escape(s['state'])}</b></div><div class="metric"><span>Образ</span><b id="node-image">{html.escape(s['image'])}</b></div><div class="metric"><span>Перезапуски</span><b id="node-restarts">{html.escape(s['restarts'])}</b></div><div class="metric"><span>Docker / Compose</span><b>{html.escape(s['docker'])} / {html.escape(s['compose'])}</b></div><div class="actions"><form method="post" action="{web_path('action')}"><input type="hidden" name="csrf" value="{csrf_token()}"><button name="action" value="start">Запустить</button><button class="secondary" name="action" value="restart">Перезапустить</button><button class="secondary" name="action" value="pull">Обновить</button></form></div></section>
 <section class="card"><div class="label">Kernel controls</div><h2>Сеть</h2><div class="metric"><span>Congestion</span><b class="ok">{html.escape(s['bbr'])}</b></div><div class="metric"><span>Queue</span><b>{html.escape(s['qdisc'])}</b></div><div class="metric"><span>Fast Open / MTU</span><b>{html.escape(s['fastopen'])} / {html.escape(s['mtu_probing'])}</b></div><form method="post" action="{web_path('network')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label class="check"><input type="checkbox" name="bbr" value="1" {'checked' if s['bbr']=='bbr' else ''}> BBR + fq</label><label class="check"><input type="checkbox" name="fastopen" value="1" {'checked' if s['fastopen']=='3' else ''}> TCP Fast Open</label><label class="check"><input type="checkbox" name="mtu" value="1" {'checked' if s['mtu_probing']=='1' else ''}> MTU probing</label><label class="check"><input type="checkbox" name="buffers" value="1" {'checked' if s['rmem_max']=='16777216' else ''}> VPN-буферы 16 MiB</label><label class="check"><input type="checkbox" name="backlog" value="1" {'checked' if s['backlog']=='8192' else ''}> Очереди 8192</label><button style="margin-top:16px">Применить переключатели</button></form><p class="muted">Снятый флажок возвращает значение, которое было до установки панели.</p></section>
 <section class="card"><div class="label">Certificates</div><h2>Хранилище TLS</h2><div class="certs">{certs}</div><p class="muted">Файлы копируются в каталог Xray и обновляются deploy-hook’ом Certbot.</p></section>
+<section class="card full"><div class="label">Access control</div><h2>SSH: ключ, порт и пароль</h2><div class="row"><div class="metric"><span>Порты сейчас</span><b>{html.escape(ssh_ports)}</b></div><div class="metric"><span>Пароль root</span><b class="{'ok' if ssh_password_on else 'warn'}">{'разрешён' if ssh_password_on else 'выключен'}</b></div><div class="metric"><span>Ключей root</span><b>{ssh['key_count']}</b></div><div class="metric"><span>Этап</span><b>{html.escape(ssh['phase'])}</b></div></div><form method="post" action="{web_path('ssh')}"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Новый SSH-порт</label><input type="number" min="1" max="65535" name="ssh_port" value="{ssh_port_value}" required></div><div><label class="check ssh-password"><input type="checkbox" name="password_auth" value="1" {'checked' if ssh_password_on else ''}> Разрешить root вход по паролю</label><p class="muted">Если снять флажок, останется только вход по ключу.</p></div></div><label>Публичный OpenSSH-ключ root</label><textarea class="ssh-key" name="public_key" spellcheck="false" placeholder="ssh-ed25519 AAAAC3... comment"></textarea><p class="mono muted">{ssh_keys}</p><div class="actions"><button>Подготовить SSH безопасно</button></div></form><div class="actions">{ssh_rollback}</div>{ssh_finalize}<p class="muted">На первом этапе новый и текущий порты работают параллельно. Старый порт убирается только после отдельного подтверждения. Перед каждым изменением создаётся резервная копия.</p></section>
 <section class="card wide"><div class="label">01 / Configuration</div><h2>Сохранить Docker Compose</h2><form method="post" action="{web_path('compose')}"><input type="hidden" name="csrf" value="{csrf_token()}"><textarea id="compose-editor" name="compose" spellcheck="false" placeholder="Вставь полный docker-compose.yml из Remnawave">{html.escape(compose_text)}</textarea><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Подключить каталог сертификатов к контейнеру</label><button>Проверить и сохранить</button></form><p class="mono muted">Каталог: /opt/remnanode · SHA-256: {html.escape(s['compose_hash'])}. Сохранение ещё не запускает контейнер.</p></section>
 <section class="card"><div class="label">02 / Certificate · optional</div><h2>Выпустить сертификат</h2><form method="post" action="{web_path('cert')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label>Домен</label><input name="domain" placeholder="node.example.com" required><label>IP сервера для проверки DNS</label><select name="expected_ip" required>{address_options}</select><p class="muted">Выбранный адрес сравнивается с A/AAAA домена. Если записей несколько, для надёжного HTTP-01 каждый опубликованный адрес должен принимать запросы этого домена на порту 80.</p><label>Email Let's Encrypt</label><input type="email" name="email" required><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Добавить volume в сохранённый Compose</label><label class="check"><input type="checkbox" name="restart_node" value="1"> Перезапустить уже работающую ноду</label><label class="check"><input type="checkbox" name="force_dns" value="1"> Игнорировать несовпадение выбранного IP и DNS</label><button>Проверить DNS и выпустить</button></form></section>
 <section class="card full"><div class="label">03 / Installation</div><h2>Выбрать версию и установить</h2><form id="install-form" action="{web_path('api/install')}" method="post"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Версия образа</label><select name="version">{tag_options}</select></div><div style="align-self:end"><button id="install-button">Начать установку</button></div></div></form><div class="pipeline"><div class="stage"><small>01 Compose</small><b id="step-compose">{'готов' if COMPOSE_FILE.exists() else 'не сохранён'}</b></div><div class="stage"><small>02 Image</small><b id="step-image">{html.escape(job.get('tag') or selected_tag)}</b></div><div class="stage"><small>03 Deploy</small><b id="step-deploy">{html.escape(job.get('phase','idle'))}</b></div><div class="stage"><small>04 Runtime</small><b id="step-runtime">{html.escape(s['state'])}</b></div></div><p id="install-message" class="mono muted">{html.escape(job.get('message','Installation has not started.'))}</p><pre id="install-log">{html.escape(job.get('log','') or 'Здесь появится ход загрузки образа и запуска контейнера.')}</pre></section>
@@ -873,6 +1262,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/compose": message = apply_compose(form)
             elif path == "/cert": message = issue_certificate(form)
             elif path == "/network": message = apply_network(form)
+            elif path == "/ssh": message = apply_ssh_access(form)
+            elif path == "/ssh-finalize": message = finalize_ssh_access(form)
+            elif path == "/ssh-rollback": message = rollback_ssh_access()
             elif path == "/inbound": message = generate_inbound(form)
             elif path == "/action": message = node_action(form)
             elif path == "/api/install":
