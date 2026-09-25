@@ -37,7 +37,8 @@ Password: generated-password
 - положить `.pem` и `.key` в `/var/lib/remnawave/configs/xray/ssl`;
 - обновлять сертификаты deploy-hook’ом Certbot и перезапускать ноду;
 - создать для каждого сертификата уникальный статический Nginx-сайт с favicon,
-  `robots.txt`, JSON-статусом, корректными `404` и TLS fallback на `127.0.0.1:8443`;
+  `robots.txt`, JSON-статусом, корректными `404`, обычным HTTPS на TCP `443`
+  (если порт не занят другим процессом) и TLS fallback на `127.0.0.1:8443`;
 - генерировать VLESS Reality self-steal и Hysteria 2 inbound;
 - независимо включать BBR, TCP Fast Open, MTU probing, VPN-буферы и очереди;
 - возвращать снятые сетевые настройки к значениям, сохранённым при установке;

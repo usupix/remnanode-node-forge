@@ -719,9 +719,20 @@ def nginx_http_config(domain):
 '''
 
 
-def nginx_tls_config(domain):
+def nginx_can_serve_public_https():
+    listeners = run(["ss", "-H", "-lntp"], check=False, timeout=10)
+    port_443 = [
+        line for line in listeners.splitlines()
+        if re.search(r"(?:^|[\[\]:.])443\s", line)
+    ]
+    return not port_443 or all('"nginx"' in line for line in port_443)
+
+
+def nginx_tls_config(domain, public_https=True):
+    public_listeners = "    listen 443 ssl;\n    listen [::]:443 ssl;\n" if public_https else ""
     return nginx_http_config(domain) + f'''
 server {{
+{public_listeners}    # Internal endpoint used as the REALITY self-steal target.
     listen 127.0.0.1:8443 ssl;
     server_name {domain};
     ssl_certificate /etc/letsencrypt/live/{domain}/fullchain.pem;
@@ -870,7 +881,8 @@ def issue_certificate(form):
         "--keep-until-expiring",
     ], timeout=600)
     sync_certificate(domain)
-    atomic_write(available, nginx_tls_config(domain), 0o644)
+    public_https = nginx_can_serve_public_https()
+    atomic_write(available, nginx_tls_config(domain, public_https), 0o644)
     run(["nginx", "-t"], timeout=20)
     run(["systemctl", "reload", "nginx"], timeout=20)
     run(["systemctl", "enable", "--now", "certbot.timer"], check=False, timeout=20)
@@ -891,7 +903,12 @@ def issue_certificate(form):
         if selected_ip in addresses else
         f" DNS mismatch was explicitly ignored for selected server IP {selected_ip}."
     )
-    return f"Certificate issued: {SSL_DIR}/{domain}.pem and {domain}.key.{dns_note}{volume_note}"
+    https_note = (
+        " Public HTTPS site enabled on TCP 443."
+        if public_https else
+        " TCP 443 is occupied by another service; the site remains available on HTTP and the internal TLS fallback."
+    )
+    return f"Certificate issued: {SSL_DIR}/{domain}.pem and {domain}.key.{dns_note}{https_note}{volume_note}"
 
 
 def reality_keys():
