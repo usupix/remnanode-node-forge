@@ -1350,7 +1350,8 @@ Group=root
 UMask=0077
 NoNewPrivileges=false
 PrivateTmp=true
-ProtectHome=true
+# The manager explicitly installs and backs up root's authorized_keys.
+ProtectHome=false
 ProtectSystem=false
 
 [Install]
