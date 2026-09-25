@@ -26,6 +26,7 @@ systemctl enable --now docker nginx
 install -d -m 0750 /opt/remnanode-manager
 install -d -m 0750 /opt/remnanode
 install -d -m 0700 /var/lib/remnanode-manager/backups /var/lib/remnanode-manager/generated
+install -d -o root -g root -m 0755 /run/sshd
 install -d -m 0755 /var/www/remnanode-manager-acme/.well-known/acme-challenge
 install -d -m 0755 /var/www/remnanode-decoy
 install -d -m 0755 /var/lib/remnawave/configs/xray/ssl
@@ -267,6 +268,15 @@ def ssh_config_files():
     return [path for path in files if path.exists() and path != SSH_MANAGED_CONFIG]
 
 
+def ensure_sshd_runtime():
+    runtime = Path("/run/sshd")
+    if runtime.exists() and not runtime.is_dir():
+        raise RuntimeError("/run/sshd exists but is not a directory.")
+    runtime.mkdir(parents=True, exist_ok=True)
+    os.chown(runtime, 0, 0)
+    os.chmod(runtime, 0o755)
+
+
 def backup_ssh_configuration(label):
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(2)
     target = BACKUP_DIR / f"{stamp}-{label}"
@@ -314,6 +324,7 @@ def restore_ssh_configuration(target):
 
 
 def sshd_settings():
+    ensure_sshd_runtime()
     output = run([
         "sshd", "-T", "-C", "user=root,host=localhost,addr=127.0.0.1",
     ], check=False, timeout=20)
@@ -397,6 +408,7 @@ def verify_ssh_auth_settings(password_auth):
 
 
 def reload_ssh_stack():
+    ensure_sshd_runtime()
     run(["sshd", "-t"], timeout=20)
     run(["systemctl", "daemon-reload"], timeout=30)
     if ssh_socket_available() and (
