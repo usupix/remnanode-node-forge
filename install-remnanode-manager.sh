@@ -1421,6 +1421,9 @@ for lineage in /etc/letsencrypt/live/*; do
   install -m 0644 "$lineage/fullchain.pem" "/var/lib/remnawave/configs/xray/ssl/$domain.pem"
   install -m 0600 "$lineage/privkey.pem" "/var/lib/remnawave/configs/xray/ssl/$domain.key"
 done
+if nginx -t >/dev/null 2>&1; then
+  systemctl reload nginx
+fi
 if docker inspect remnanode >/dev/null 2>&1; then
   docker restart remnanode >/dev/null
 fi
