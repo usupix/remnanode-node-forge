@@ -768,6 +768,26 @@ def nginx_can_serve_public_https():
 
 def nginx_tls_config(domain, public_https=True):
     public_listeners = "    listen 443 ssl;\n    listen [::]:443 ssl;\n" if public_https else ""
+    manager_location = f'''    location = {BASE_PATH} {{ return 302 {BASE_PATH}/; }}
+    location ^~ {BASE_PATH}/ {{
+        proxy_pass http://127.0.0.1:8765;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 1200s;
+        proxy_send_timeout 1200s;
+        proxy_buffering off;
+        proxy_cache off;
+        client_max_body_size 1m;
+        add_header X-Frame-Options DENY always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy no-referrer always;
+        add_header Cache-Control no-store always;
+    }}
+'''
     return nginx_http_config(domain) + f'''
 server {{
 {public_listeners}    # Internal endpoint used as the REALITY self-steal target.
@@ -780,9 +800,42 @@ server {{
     ssl_session_timeout 1d;
     root /var/www/remnanode-decoy/{domain};
     index index.html;
+{manager_location}
     location / {{ try_files $uri $uri/ =404; }}
 }}
 '''
+
+
+def refresh_https_manager_routes():
+    """Upgrade only Node Forge-owned TLS sites, preserving a rollback copy."""
+    updated = []
+    for available in Path("/etc/nginx/sites-available").glob("rnm-*.conf"):
+        domain = available.name[4:-5]
+        if not DOMAIN_RE.fullmatch(domain):
+            continue
+        current = available.read_text(encoding="utf-8")
+        if "# Internal endpoint used as the REALITY self-steal target." not in current:
+            continue
+        if not (Path("/etc/letsencrypt/live") / domain / "fullchain.pem").exists():
+            continue
+        public_https = "listen 443 ssl;" in current
+        candidate = nginx_tls_config(domain, public_https)
+        if current != candidate:
+            updated.append((available, current, candidate))
+    if not updated:
+        return []
+    backup([item[0] for item in updated], "manager-https")
+    try:
+        for available, _, candidate in updated:
+            atomic_write(available, candidate, 0o644)
+        run(["nginx", "-t"], timeout=20)
+        run(["systemctl", "reload", "nginx"], timeout=20)
+    except Exception:
+        for available, original, _ in updated:
+            atomic_write(available, original, 0o644)
+        run(["systemctl", "reload", "nginx"], check=False, timeout=20)
+        raise
+    return [available.name[4:-5] for available, _, _ in updated]
 
 
 def create_decoy_site(domain):
@@ -1244,7 +1297,7 @@ CSS = r'''
 
 
 def render_login(error=""):
-    return f'''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Node Forge login</title><style>{CSS}.login{{max-width:460px;margin:12vh auto;padding:28px;background:var(--panel);border:1px solid var(--line)}}.login h1{{font-size:48px}}</style><div class="login"><div class="eyebrow">Meltun infrastructure</div><h1>Node<br>Forge</h1>{f'<p class="error">{html.escape(error)}</p>' if error else ''}<form method="post" action="{web_path('login')}"><label>Пароль администратора</label><input autofocus type="password" name="password" autocomplete="current-password"><button style="margin-top:16px">Открыть панель</button></form><p class="muted">Панель защищена секретным URL и отдельным паролем. Пока используется HTTP, не открывай её в чужой сети.</p></div></html>'''
+    return f'''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Node Forge login</title><style>{CSS}.login{{max-width:460px;margin:12vh auto;padding:28px;background:var(--panel);border:1px solid var(--line)}}.login h1{{font-size:48px}}</style><div class="login"><div class="eyebrow">Meltun infrastructure</div><h1>Node<br>Forge</h1>{f'<p class="error">{html.escape(error)}</p>' if error else ''}<form method="post" action="{web_path('login')}"><label>Пароль администратора</label><input autofocus type="password" name="password" autocomplete="current-password"><button style="margin-top:16px">Открыть панель</button></form><p class="muted">Для настройки передачи логов откройте панель по HTTPS-ссылке на домене ноды.</p></div></html>'''
 
 
 def render_dashboard(message="", error=""):
@@ -1267,6 +1320,10 @@ def render_dashboard(message="", error=""):
     last = (STATE_DIR / "last-inbound.json").read_text(encoding="utf-8") if (STATE_DIR / "last-inbound.json").exists() else ""
     meta = json.loads((STATE_DIR / "last-meta.json").read_text()) if (STATE_DIR / "last-meta.json").exists() else {}
     certs = "".join(f'<span class="pill">{html.escape(x)}</span>' for x in s["certs"]) or '<span class="muted">Пока нет</span>'
+    https_domains = [domain for domain in s["certs"] if (Path("/etc/nginx/sites-available") / f"rnm-{domain}.conf").exists()]
+    https_links = " ".join(f'<a class="button secondary" href="https://{html.escape(domain)}{web_path()}">https://{html.escape(domain)}{web_path()}</a>' for domain in https_domains)
+    if not https_links:
+        https_links = '<span class="muted">Сначала выпустите сертификат для домена ноды ниже.</span>'
     ssh = s["ssh"]
     ssh_ports = ", ".join(map(str, ssh["ports"])) or "unknown"
     ssh_port_value = ssh["desired_port"] or (ssh["ports"][0] if ssh["ports"] else 22)
@@ -1285,7 +1342,7 @@ def render_dashboard(message="", error=""):
 <section class="card"><div class="label">Certificates</div><h2>Хранилище TLS</h2><div class="certs">{certs}</div><p class="muted">Файлы копируются в каталог Xray и обновляются deploy-hook’ом Certbot.</p></section>
 <section class="card full"><div class="label">Access control</div><h2>SSH: ключ, порт и пароль</h2><div class="row"><div class="metric"><span>Порты сейчас</span><b>{html.escape(ssh_ports)}</b></div><div class="metric"><span>Пароль root</span><b class="{'ok' if ssh_password_on else 'warn'}">{'разрешён' if ssh_password_on else 'выключен'}</b></div><div class="metric"><span>Ключей root</span><b>{ssh['key_count']}</b></div><div class="metric"><span>Этап</span><b>{html.escape(ssh['phase'])}</b></div></div><form method="post" action="{web_path('ssh')}"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Новый SSH-порт</label><input type="number" min="1" max="65535" name="ssh_port" value="{ssh_port_value}" required></div><div><label class="check ssh-password"><input type="checkbox" name="password_auth" value="1" {'checked' if ssh_password_on else ''}> Разрешить root вход по паролю</label><p class="muted">Если снять флажок, останется только вход по ключу.</p></div></div><label>Публичный OpenSSH-ключ root</label><textarea class="ssh-key" name="public_key" spellcheck="false" placeholder="ssh-ed25519 AAAAC3... comment"></textarea><p class="mono muted">{ssh_keys}</p><div class="actions"><button>Подготовить SSH безопасно</button></div></form><div class="actions">{ssh_rollback}</div>{ssh_finalize}<p class="muted">На первом этапе новый и текущий порты работают параллельно. Старый порт убирается только после отдельного подтверждения. Перед каждым изменением создаётся резервная копия.</p></section>
 <section class="card wide"><div class="label">01 / Configuration</div><h2>Сохранить Docker Compose</h2><form method="post" action="{web_path('compose')}"><input type="hidden" name="csrf" value="{csrf_token()}"><textarea id="compose-editor" name="compose" spellcheck="false" placeholder="Вставь полный docker-compose.yml из Remnawave">{html.escape(compose_text)}</textarea><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Подключить каталог сертификатов к контейнеру</label><button>Проверить и сохранить</button></form><p class="mono muted">Каталог: /opt/remnanode · SHA-256: {html.escape(s['compose_hash'])}. Сохранение ещё не запускает контейнер.</p></section>
-<section class="card wide"><div class="label">Access logs</div><h2>Передавать подключения в Meltun</h2><form method="post" action="{web_path('access-forwarder')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label>ID ноды</label><input name="node_id" value="{html.escape(forwarder_config.get('node_id', ''))}" placeholder="de-1" required><label>HTTPS endpoint</label><input name="endpoint" value="https://meltun.org/api/admin/node-logs/ingest" required><label>Часовой пояс логов Xray</label><select name="log_timezone"><option value="UTC" {'selected' if forwarder_config.get('log_timezone', 'UTC') == 'UTC' else ''}>UTC</option><option value="Europe/Moscow" {'selected' if forwarder_config.get('log_timezone') == 'Europe/Moscow' else ''}>Europe/Moscow</option></select><label>Ключ из веб-админки Meltun</label><input name="token" type="password" autocomplete="off" placeholder="Вставьте выданный ключ" required><button>Сохранить и запустить сбор</button></form><p class="muted">Откройте Node Forge через HTTPS или SSH-туннель перед вводом ключа. В конфигурационном профиле Xray панели задайте log.access = /var/log/remnanode/access.log. Изменение Compose-монтирования требует пересоздания контейнера.</p></section>
+<section class="card wide"><div class="label">Access logs</div><h2>Передавать подключения в Meltun</h2><p>Защищённый вход в Node Forge:</p><div class="actions">{https_links}</div><p class="muted">Домен должен указывать на эту ноду и принимать HTTPS на порту 443. Если порт занят Xray REALITY, запрос с этим доменом попадёт в его TLS self-steal.</p><form method="post" action="{web_path('access-forwarder')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label>ID ноды</label><input name="node_id" value="{html.escape(forwarder_config.get('node_id', ''))}" placeholder="de-1" required><label>HTTPS endpoint</label><input name="endpoint" value="https://meltun.org/api/admin/node-logs/ingest" required><label>Часовой пояс логов Xray</label><select name="log_timezone"><option value="UTC" {'selected' if forwarder_config.get('log_timezone', 'UTC') == 'UTC' else ''}>UTC</option><option value="Europe/Moscow" {'selected' if forwarder_config.get('log_timezone') == 'Europe/Moscow' else ''}>Europe/Moscow</option></select><label>Общий ключ из веб-админки Meltun</label><input name="token" type="password" autocomplete="off" placeholder="Вставьте общий ключ" required><button>Сохранить и запустить сбор</button></form><p class="muted">Введите ключ после перехода по HTTPS-ссылке. В конфигурационном профиле Xray панели задайте log.access = /var/log/remnanode/access.log. Изменение Compose-монтирования требует пересоздания контейнера.</p></section>
 <section class="card"><div class="label">02 / Certificate · optional</div><h2>Выпустить сертификат</h2><form method="post" action="{web_path('cert')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label>Домен</label><input name="domain" placeholder="node.example.com" required><label>IP сервера для проверки DNS</label><select name="expected_ip" required>{address_options}</select><p class="muted">Выбранный адрес сравнивается с A/AAAA домена. Если записей несколько, для надёжного HTTP-01 каждый опубликованный адрес должен принимать запросы этого домена на порту 80.</p><label>Email Let's Encrypt</label><input type="email" name="email" required><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Добавить volume в сохранённый Compose</label><label class="check"><input type="checkbox" name="restart_node" value="1"> Перезапустить уже работающую ноду</label><label class="check"><input type="checkbox" name="force_dns" value="1"> Игнорировать несовпадение выбранного IP и DNS</label><button>Проверить DNS и выпустить</button></form></section>
 <section class="card full"><div class="label">03 / Installation</div><h2>Выбрать версию и установить</h2><form id="install-form" action="{web_path('api/install')}" method="post"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Версия образа</label><select name="version">{tag_options}</select></div><div style="align-self:end"><button id="install-button">Начать установку</button></div></div></form><div class="pipeline"><div class="stage"><small>01 Compose</small><b id="step-compose">{'готов' if COMPOSE_FILE.exists() else 'не сохранён'}</b></div><div class="stage"><small>02 Image</small><b id="step-image">{html.escape(job.get('tag') or selected_tag)}</b></div><div class="stage"><small>03 Deploy</small><b id="step-deploy">{html.escape(job.get('phase','idle'))}</b></div><div class="stage"><small>04 Runtime</small><b id="step-runtime">{html.escape(s['state'])}</b></div></div><p id="install-message" class="mono muted">{html.escape(job.get('message','Installation has not started.'))}</p><pre id="install-log">{html.escape(job.get('log','') or 'Здесь появится ход загрузки образа и запуска контейнера.')}</pre></section>
 <section class="card full"><div class="label">04 / Profile builder</div><h2>Сгенерировать inbound</h2><form method="post" action="{web_path('inbound')}"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Тип</label><select name="kind"><option value="reality">VLESS TCP Reality + self-steal</option><option value="hysteria">Hysteria 2 TLS</option></select></div><div><label>Tag</label><input name="tag" value="VLESS_REALITY"></div><div><label>Порт</label><input type="number" min="1" max="65535" name="inbound_port" value="2053"></div><div><label>Домен</label><input name="inbound_domain" placeholder="node.example.com" required></div></div><button>Сгенерировать inbound</button></form>{inbound}</section>
@@ -1416,7 +1473,8 @@ class Handler(BaseHTTPRequestHandler):
             if hmac.compare_digest(form.get("password", [""])[0], ADMIN_PASSWORD):
                 attempts.pop(ip, None)
                 self.send_response(303); self.send_header("Location", web_path())
-                self.send_header("Set-Cookie", f"rnm_session={session_token()}; HttpOnly; SameSite=Strict; Path={web_path()}")
+                secure_cookie = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
+                self.send_header("Set-Cookie", f"rnm_session={session_token()}; HttpOnly; SameSite=Strict; Path={web_path()}{secure_cookie}")
                 self.send_header("Content-Length", "0")
                 return self.end_headers()
             record.append(now); return self.send_html(render_login("Wrong password."), 401)
@@ -1715,6 +1773,23 @@ EOF
 ln -sfn /etc/nginx/sites-available/remnanode-manager /etc/nginx/sites-enabled/remnanode-manager
 nginx -t
 systemctl reload nginx
+
+# Re-installing Node Forge upgrades existing managed TLS sites without
+# reissuing certificates or changing the Xray/REALITY listener.
+python3 - <<'PY'
+import os
+import runpy
+
+with open('/etc/remnanode-manager.env', encoding='utf-8') as env_file:
+    for line in env_file:
+        key, separator, value = line.strip().partition('=')
+        if separator and key.startswith('RNM_'):
+            os.environ[key] = value
+app = runpy.run_path('/opt/remnanode-manager/app.py')
+domains = app['refresh_https_manager_routes']()
+if domains:
+    print('HTTPS manager routes updated: ' + ', '.join(domains))
+PY
 
 cat > /root/remnanode-manager-access.txt <<EOF
 RemnaNode Node Forge
