@@ -50,6 +50,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -632,23 +633,48 @@ def apply_compose(form):
     return f"Compose validated and saved. Choose a RemnaNode version, then start installation. Backup: {saved}"
 
 
+def redeem_pair_code(node_id, code):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,64}", code):
+        raise ValueError("Enter a valid one-time pairing code.")
+    request = urllib.request.Request(
+        "https://meltun.org/api/admin/node-logs/pair",
+        data=json.dumps({"node_id": node_id, "code": code}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (400, 401, 422):
+            raise ValueError("Pairing code expired, was already used, or this node's public IP differs from the IP entered in Meltun.") from exc
+        raise RuntimeError(f"Meltun pairing failed (HTTP {exc.code}).") from exc
+    token = payload.get("token", "")
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{40,128}", token):
+        raise RuntimeError("Meltun returned an invalid node token.")
+    return token
+
+
 def configure_access_forwarder(form):
     endpoint = form.get("endpoint", [""])[0].strip()
     node_id = form.get("node_id", [""])[0].strip()
     token = form.get("token", [""])[0].strip()
+    pair_code = form.get("pair_code", [""])[0].strip()
     log_timezone = form.get("log_timezone", ["UTC"])[0].strip()
     if endpoint != "https://meltun.org/api/admin/node-logs/ingest":
         raise ValueError("Endpoint must be https://meltun.org/api/admin/node-logs/ingest")
     if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,80}", node_id):
         raise ValueError("Node ID may contain only letters, digits, dots, underscores and hyphens.")
-    if not re.fullmatch(r"[a-zA-Z0-9_-]{40,128}", token):
-        raise ValueError("Paste the token issued by Meltun web admin.")
     if log_timezone not in ("UTC", "Europe/Moscow"):
         raise ValueError("Unsupported Xray log timezone.")
+    if pair_code:
+        token = redeem_pair_code(node_id, pair_code)
+    elif not re.fullmatch(r"[a-zA-Z0-9_-]{40,128}", token):
+        raise ValueError("Enter the one-time pairing code from Meltun web admin.")
     atomic_write(ACCESS_FORWARDER_CONFIG, json.dumps({"endpoint": endpoint, "node_id": node_id, "token": token, "log_timezone": log_timezone}), mode=0o600)
     run(["systemctl", "enable", "--now", "remnanode-access-forwarder.service"])
     run(["systemctl", "restart", "remnanode-access-forwarder.service"])
-    return "Xray access-log forwarder configured. Check its last-seen time in Meltun web admin."
+    return "Node paired and Xray access-log forwarding configured. Check its last-seen time in Meltun web admin."
 
 
 def install_worker(tag):
@@ -1311,7 +1337,7 @@ CSS = r'''
 
 
 def render_login(error=""):
-    return f'''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Node Forge login</title><style>{CSS}.login{{max-width:460px;margin:12vh auto;padding:28px;background:var(--panel);border:1px solid var(--line)}}.login h1{{font-size:48px}}</style><div class="login"><div class="eyebrow">Meltun infrastructure</div><h1>Node<br>Forge</h1>{f'<p class="error">{html.escape(error)}</p>' if error else ''}<form method="post" action="{web_path('login')}"><label>Пароль администратора</label><input autofocus type="password" name="password" autocomplete="current-password"><button style="margin-top:16px">Открыть панель</button></form><p class="muted">Для настройки передачи логов откройте панель по HTTPS-ссылке на домене ноды.</p></div></html>'''
+    return f'''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Node Forge login</title><style>{CSS}.login{{max-width:460px;margin:12vh auto;padding:28px;background:var(--panel);border:1px solid var(--line)}}.login h1{{font-size:48px}}</style><div class="login"><div class="eyebrow">Meltun infrastructure</div><h1>Node<br>Forge</h1>{f'<p class="error">{html.escape(error)}</p>' if error else ''}<form method="post" action="{web_path('login')}"><label>Пароль администратора</label><input autofocus type="password" name="password" autocomplete="current-password"><button style="margin-top:16px">Открыть панель</button></form><p class="muted">Одноразовый код подключения ноды можно ввести без сертификата. При HTTP пароль этой панели передаётся без шифрования.</p></div></html>'''
 
 
 def render_dashboard(message="", error=""):
@@ -1336,8 +1362,7 @@ def render_dashboard(message="", error=""):
     certs = "".join(f'<span class="pill">{html.escape(x)}</span>' for x in s["certs"]) or '<span class="muted">Пока нет</span>'
     https_domains = [domain for domain in s["certs"] if (Path("/etc/nginx/sites-available") / f"rnm-{domain}.conf").exists()]
     https_links = " ".join(f'<a class="button secondary" href="https://{html.escape(domain)}{web_path()}">https://{html.escape(domain)}{web_path()}</a>' for domain in https_domains)
-    if not https_links:
-        https_links = '<span class="muted">Сначала выпустите сертификат для домена ноды ниже.</span>'
+    https_links = f'<p class="muted">Если у ноды уже есть домен с TLS, панель доступна и по HTTPS:</p><div class="actions">{https_links}</div>' if https_links else ""
     ssh = s["ssh"]
     ssh_ports = ", ".join(map(str, ssh["ports"])) or "unknown"
     ssh_port_value = ssh["desired_port"] or (ssh["ports"][0] if ssh["ports"] else 22)
@@ -1356,7 +1381,7 @@ def render_dashboard(message="", error=""):
 <section class="card"><div class="label">Certificates</div><h2>Хранилище TLS</h2><div class="certs">{certs}</div><p class="muted">Файлы копируются в каталог Xray и обновляются deploy-hook’ом Certbot.</p></section>
 <section class="card full"><div class="label">Access control</div><h2>SSH: ключ, порт и пароль</h2><div class="row"><div class="metric"><span>Порты сейчас</span><b>{html.escape(ssh_ports)}</b></div><div class="metric"><span>Пароль root</span><b class="{'ok' if ssh_password_on else 'warn'}">{'разрешён' if ssh_password_on else 'выключен'}</b></div><div class="metric"><span>Ключей root</span><b>{ssh['key_count']}</b></div><div class="metric"><span>Этап</span><b>{html.escape(ssh['phase'])}</b></div></div><form method="post" action="{web_path('ssh')}"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Новый SSH-порт</label><input type="number" min="1" max="65535" name="ssh_port" value="{ssh_port_value}" required></div><div><label class="check ssh-password"><input type="checkbox" name="password_auth" value="1" {'checked' if ssh_password_on else ''}> Разрешить root вход по паролю</label><p class="muted">Если снять флажок, останется только вход по ключу.</p></div></div><label>Публичный OpenSSH-ключ root</label><textarea class="ssh-key" name="public_key" spellcheck="false" placeholder="ssh-ed25519 AAAAC3... comment"></textarea><p class="mono muted">{ssh_keys}</p><div class="actions"><button>Подготовить SSH безопасно</button></div></form><div class="actions">{ssh_rollback}</div>{ssh_finalize}<p class="muted">На первом этапе новый и текущий порты работают параллельно. Старый порт убирается только после отдельного подтверждения. Перед каждым изменением создаётся резервная копия.</p></section>
 <section class="card wide"><div class="label">01 / Configuration</div><h2>Сохранить Docker Compose</h2><form method="post" action="{web_path('compose')}"><input type="hidden" name="csrf" value="{csrf_token()}"><textarea id="compose-editor" name="compose" spellcheck="false" placeholder="Вставь полный docker-compose.yml из Remnawave">{html.escape(compose_text)}</textarea><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Подключить каталог сертификатов к контейнеру</label><button>Проверить и сохранить</button></form><p class="mono muted">Каталог: /opt/remnanode · SHA-256: {html.escape(s['compose_hash'])}. Сохранение ещё не запускает контейнер.</p></section>
-<section class="card wide"><div class="label">Access logs</div><h2>Передавать подключения в Meltun</h2><p>Защищённый вход в Node Forge:</p><div class="actions">{https_links}</div><p class="muted">Домен должен указывать на эту ноду и принимать HTTPS на порту 443. Если порт занят Xray REALITY, запрос с этим доменом попадёт в его TLS self-steal.</p><form method="post" action="{web_path('access-forwarder')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label>ID ноды</label><input name="node_id" value="{html.escape(forwarder_config.get('node_id', ''))}" placeholder="de-1" required><label>HTTPS endpoint</label><input name="endpoint" value="https://meltun.org/api/admin/node-logs/ingest" required><label>Часовой пояс логов Xray</label><select name="log_timezone"><option value="UTC" {'selected' if forwarder_config.get('log_timezone', 'UTC') == 'UTC' else ''}>UTC</option><option value="Europe/Moscow" {'selected' if forwarder_config.get('log_timezone') == 'Europe/Moscow' else ''}>Europe/Moscow</option></select><label>Общий ключ из веб-админки Meltun</label><input name="token" type="password" autocomplete="off" placeholder="Вставьте общий ключ" required><button>Сохранить и запустить сбор</button></form><p class="muted">Введите ключ после перехода по HTTPS-ссылке. В конфигурационном профиле Xray панели задайте log.access = /var/log/remnanode/access.log. Изменение Compose-монтирования требует пересоздания контейнера.</p></section>
+<section class="card wide"><div class="label">Access logs</div><h2>Передавать подключения в Meltun</h2><p>В веб-админке MelTun откройте «Ноды → Сбор логов Xray», укажите ID и публичный IP этой ноды и получите одноразовый код. Домен и сертификат ноде не нужны.</p>{https_links}<form method="post" action="{web_path('access-forwarder')}"><input type="hidden" name="csrf" value="{csrf_token()}"><input type="hidden" name="endpoint" value="https://meltun.org/api/admin/node-logs/ingest"><label>ID ноды</label><input name="node_id" value="{html.escape(forwarder_config.get('node_id', ''))}" placeholder="GERMANY" required><label>Часовой пояс логов Xray</label><select name="log_timezone"><option value="UTC" {'selected' if forwarder_config.get('log_timezone', 'UTC') == 'UTC' else ''}>UTC</option><option value="Europe/Moscow" {'selected' if forwarder_config.get('log_timezone') == 'Europe/Moscow' else ''}>Europe/Moscow</option></select><label>Одноразовый код из MelTun</label><input name="pair_code" type="password" autocomplete="off" placeholder="Код действует 10 минут" required><button>Подключить ноду</button></form><p class="muted">Нода сама получит рабочий ключ по исходящему HTTPS и сохранит его локально. В конфигурационном профиле Xray панели задайте log.access = /var/log/remnanode/access.log. Изменение Compose-монтирования требует пересоздания контейнера.</p></section>
 <section class="card"><div class="label">02 / Certificate · optional</div><h2>Выпустить сертификат</h2><form method="post" action="{web_path('cert')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label>Домен</label><input name="domain" placeholder="node.example.com" required><label>IP сервера для проверки DNS</label><select name="expected_ip" required>{address_options}</select><p class="muted">Выбранный адрес сравнивается с A/AAAA домена. Если записей несколько, для надёжного HTTP-01 каждый опубликованный адрес должен принимать запросы этого домена на порту 80.</p><label>Email Let's Encrypt</label><input type="email" name="email" required><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Добавить volume в сохранённый Compose</label><label class="check"><input type="checkbox" name="restart_node" value="1"> Перезапустить уже работающую ноду</label><label class="check"><input type="checkbox" name="force_dns" value="1"> Игнорировать несовпадение выбранного IP и DNS</label><button>Проверить DNS и выпустить</button></form></section>
 <section class="card full"><div class="label">03 / Installation</div><h2>Выбрать версию и установить</h2><form id="install-form" action="{web_path('api/install')}" method="post"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Версия образа</label><select name="version">{tag_options}</select></div><div style="align-self:end"><button id="install-button">Начать установку</button></div></div></form><div class="pipeline"><div class="stage"><small>01 Compose</small><b id="step-compose">{'готов' if COMPOSE_FILE.exists() else 'не сохранён'}</b></div><div class="stage"><small>02 Image</small><b id="step-image">{html.escape(job.get('tag') or selected_tag)}</b></div><div class="stage"><small>03 Deploy</small><b id="step-deploy">{html.escape(job.get('phase','idle'))}</b></div><div class="stage"><small>04 Runtime</small><b id="step-runtime">{html.escape(s['state'])}</b></div></div><p id="install-message" class="mono muted">{html.escape(job.get('message','Installation has not started.'))}</p><pre id="install-log">{html.escape(job.get('log','') or 'Здесь появится ход загрузки образа и запуска контейнера.')}</pre></section>
 <section class="card full"><div class="label">04 / Profile builder</div><h2>Сгенерировать inbound</h2><form method="post" action="{web_path('inbound')}"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Тип</label><select name="kind"><option value="reality">VLESS TCP Reality + self-steal</option><option value="hysteria">Hysteria 2 TLS</option></select></div><div><label>Tag</label><input name="tag" value="VLESS_REALITY"></div><div><label>Порт</label><input type="number" min="1" max="65535" name="inbound_port" value="2053"></div><div><label>Домен</label><input name="inbound_domain" placeholder="node.example.com" required></div></div><button>Сгенерировать inbound</button></form>{inbound}</section>
@@ -1497,8 +1522,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "Authentication required."}, 401) if is_api else self.send_html(render_login(), 401)
         if not hmac.compare_digest(form.get("csrf", [""])[0], csrf_token()):
             return self.send_json({"error": "CSRF validation failed."}, 403) if is_api else self.redirect(error="CSRF validation failed.")
-        if path == "/access-forwarder" and not (self.headers.get("X-Forwarded-Proto") == "https" or (self.client_address[0] in ("127.0.0.1", "::1") and "X-Forwarded-For" not in self.headers)):
-            return self.redirect(error="Open Node Forge over HTTPS or an SSH tunnel before sending the node token.")
+        if path == "/access-forwarder" and form.get("token", [""])[0].strip() and not (self.headers.get("X-Forwarded-Proto") == "https" or (self.client_address[0] in ("127.0.0.1", "::1") and "X-Forwarded-For" not in self.headers)):
+            return self.redirect(error="Open Node Forge over HTTPS or an SSH tunnel before sending a reusable node token. A one-time pairing code can be used here over HTTP.")
         try:
             if path == "/compose": message = apply_compose(form)
             elif path == "/access-forwarder": message = configure_access_forwarder(form)
