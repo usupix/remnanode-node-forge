@@ -766,9 +766,8 @@ def nginx_can_serve_public_https():
     return not port_443 or all('"nginx"' in line for line in port_443)
 
 
-def nginx_tls_config(domain, public_https=True):
-    public_listeners = "    listen 443 ssl;\n    listen [::]:443 ssl;\n" if public_https else ""
-    manager_location = f'''    location = {BASE_PATH} {{ return 302 {BASE_PATH}/; }}
+def nginx_manager_location():
+    return f'''    location = {BASE_PATH} {{ return 302 {BASE_PATH}/; }}
     location ^~ {BASE_PATH}/ {{
         proxy_pass http://127.0.0.1:8765;
         proxy_http_version 1.1;
@@ -788,6 +787,11 @@ def nginx_tls_config(domain, public_https=True):
         add_header Cache-Control no-store always;
     }}
 '''
+
+
+def nginx_tls_config(domain, public_https=True):
+    public_listeners = "    listen 443 ssl;\n    listen [::]:443 ssl;\n" if public_https else ""
+    manager_location = nginx_manager_location()
     return nginx_http_config(domain) + f'''
 server {{
 {public_listeners}    # Internal endpoint used as the REALITY self-steal target.
@@ -806,6 +810,17 @@ server {{
 '''
 
 
+def add_manager_location(current):
+    if f"location ^~ {BASE_PATH}/" in current:
+        return current
+    marker = "    location / { try_files $uri $uri/ =404; }"
+    tls_start = current.index("# Internal endpoint used as the REALITY self-steal target.")
+    insert_at = current.find(marker, tls_start)
+    if insert_at < 0:
+        raise RuntimeError("Cannot find TLS fallback location in the managed site")
+    return current[:insert_at] + nginx_manager_location() + current[insert_at:]
+
+
 def refresh_https_manager_routes():
     """Upgrade only Node Forge-owned TLS sites, preserving a rollback copy."""
     updated = []
@@ -818,9 +833,8 @@ def refresh_https_manager_routes():
             continue
         if not (Path("/etc/letsencrypt/live") / domain / "fullchain.pem").exists():
             continue
-        public_https = "listen 443 ssl;" in current
-        candidate = nginx_tls_config(domain, public_https)
-        if current != candidate:
+        candidate = add_manager_location(current)
+        if candidate != current:
             updated.append((available, current, candidate))
     if not updated:
         return []
