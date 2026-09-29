@@ -47,6 +47,14 @@ class PairingTests(unittest.TestCase):
         self.assertNotIn("pair_code", saved["data"])
         self.assertEqual(saved["mode"], 0o600)
 
+    def test_pairing_shows_specific_id_error(self):
+        scope = load_pairing()
+        response = io.BytesIO(json.dumps({"detail": "Для указанного ID ноды нет активного кода."}).encode())
+        error = urllib.error.HTTPError("https://meltun.org/api/admin/node-logs/pair", 404, "Not Found", {}, response)
+        with patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaisesRegex(ValueError, "ID ноды нет активного кода"):
+                scope["redeem_pair_code"]("GERMANY", "a" * 32)
+
 
 if __name__ == "__main__":
     unittest.main()
