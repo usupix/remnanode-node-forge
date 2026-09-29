@@ -30,6 +30,7 @@ install -d -o root -g root -m 0755 /run/sshd
 install -d -m 0755 /var/www/remnanode-manager-acme/.well-known/acme-challenge
 install -d -m 0755 /var/www/remnanode-decoy
 install -d -m 0755 /var/lib/remnawave/configs/xray/ssl
+install -d -m 0755 /var/log/remnanode
 
 cat > /opt/remnanode-manager/app.py <<'PY'
 #!/usr/bin/env python3
@@ -63,6 +64,8 @@ GENERATED_DIR = STATE_DIR / "generated"
 COMPOSE_DIR = Path("/opt/remnanode")
 COMPOSE_FILE = COMPOSE_DIR / "docker-compose.yml"
 SSL_DIR = Path("/var/lib/remnawave/configs/xray/ssl")
+XRAY_LOG_DIR = Path("/var/log/remnanode")
+ACCESS_FORWARDER_CONFIG = Path("/etc/remnanode-access-forwarder.json")
 SYSCTL_BBR = Path("/etc/sysctl.d/99-vpn-bbr.conf")
 SYSCTL_TUNE = Path("/etc/sysctl.d/99-remnanode-manager-network.conf")
 NETWORK_BASELINE = STATE_DIR / "network-baseline.json"
@@ -585,7 +588,23 @@ def ensure_cert_volume(config):
     return False
 
 
+def ensure_log_volume(config):
+    service = config.get("services", {}).get("remnanode") if isinstance(config, dict) else None
+    if not isinstance(service, dict):
+        raise ValueError("Service remnanode was not found.")
+    volumes = service.setdefault("volumes", [])
+    if not isinstance(volumes, list):
+        raise ValueError("remnanode.volumes must be a list.")
+    host_dir = str(XRAY_LOG_DIR)
+    mount = f"{host_dir}:{host_dir}"
+    if not any(isinstance(item, str) and item.split(":", 1)[0] == host_dir for item in volumes):
+        volumes.append(mount)
+        return True
+    return False
+
+
 def write_compose(config, label):
+    ensure_log_volume(config)
     rendered = yaml.safe_dump(config, sort_keys=False, allow_unicode=True, width=4096)
     COMPOSE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = COMPOSE_DIR / ".docker-compose.candidate.yml"
@@ -611,6 +630,25 @@ def apply_compose(form):
             raise ValueError("Compose must contain services.remnanode.")
     saved = write_compose(config, "compose")
     return f"Compose validated and saved. Choose a RemnaNode version, then start installation. Backup: {saved}"
+
+
+def configure_access_forwarder(form):
+    endpoint = form.get("endpoint", [""])[0].strip()
+    node_id = form.get("node_id", [""])[0].strip()
+    token = form.get("token", [""])[0].strip()
+    log_timezone = form.get("log_timezone", ["UTC"])[0].strip()
+    if endpoint != "https://meltun.org/api/admin/node-logs/ingest":
+        raise ValueError("Endpoint must be https://meltun.org/api/admin/node-logs/ingest")
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,80}", node_id):
+        raise ValueError("Node ID may contain only letters, digits, dots, underscores and hyphens.")
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{40,128}", token):
+        raise ValueError("Paste the token issued by Meltun web admin.")
+    if log_timezone not in ("UTC", "Europe/Moscow"):
+        raise ValueError("Unsupported Xray log timezone.")
+    atomic_write(ACCESS_FORWARDER_CONFIG, json.dumps({"endpoint": endpoint, "node_id": node_id, "token": token, "log_timezone": log_timezone}), mode=0o600)
+    run(["systemctl", "enable", "--now", "remnanode-access-forwarder.service"])
+    run(["systemctl", "restart", "remnanode-access-forwarder.service"])
+    return "Xray access-log forwarder configured. Check its last-seen time in Meltun web admin."
 
 
 def install_worker(tag):
@@ -1218,6 +1256,7 @@ def render_dashboard(message="", error=""):
         for item in addresses
     ) or '<option value="">Адреса не найдены — обнови страницу</option>'
     compose_text = COMPOSE_FILE.read_text(encoding="utf-8") if COMPOSE_FILE.exists() else ""
+    forwarder_config = json.loads(ACCESS_FORWARDER_CONFIG.read_text()) if ACCESS_FORWARDER_CONFIG.exists() else {}
     tags = image_tags()
     selected_tag = s["image"].rsplit(":", 1)[-1] if s["image"].startswith("remnawave/node:") else "latest"
     tag_options = "".join(
@@ -1246,6 +1285,7 @@ def render_dashboard(message="", error=""):
 <section class="card"><div class="label">Certificates</div><h2>Хранилище TLS</h2><div class="certs">{certs}</div><p class="muted">Файлы копируются в каталог Xray и обновляются deploy-hook’ом Certbot.</p></section>
 <section class="card full"><div class="label">Access control</div><h2>SSH: ключ, порт и пароль</h2><div class="row"><div class="metric"><span>Порты сейчас</span><b>{html.escape(ssh_ports)}</b></div><div class="metric"><span>Пароль root</span><b class="{'ok' if ssh_password_on else 'warn'}">{'разрешён' if ssh_password_on else 'выключен'}</b></div><div class="metric"><span>Ключей root</span><b>{ssh['key_count']}</b></div><div class="metric"><span>Этап</span><b>{html.escape(ssh['phase'])}</b></div></div><form method="post" action="{web_path('ssh')}"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Новый SSH-порт</label><input type="number" min="1" max="65535" name="ssh_port" value="{ssh_port_value}" required></div><div><label class="check ssh-password"><input type="checkbox" name="password_auth" value="1" {'checked' if ssh_password_on else ''}> Разрешить root вход по паролю</label><p class="muted">Если снять флажок, останется только вход по ключу.</p></div></div><label>Публичный OpenSSH-ключ root</label><textarea class="ssh-key" name="public_key" spellcheck="false" placeholder="ssh-ed25519 AAAAC3... comment"></textarea><p class="mono muted">{ssh_keys}</p><div class="actions"><button>Подготовить SSH безопасно</button></div></form><div class="actions">{ssh_rollback}</div>{ssh_finalize}<p class="muted">На первом этапе новый и текущий порты работают параллельно. Старый порт убирается только после отдельного подтверждения. Перед каждым изменением создаётся резервная копия.</p></section>
 <section class="card wide"><div class="label">01 / Configuration</div><h2>Сохранить Docker Compose</h2><form method="post" action="{web_path('compose')}"><input type="hidden" name="csrf" value="{csrf_token()}"><textarea id="compose-editor" name="compose" spellcheck="false" placeholder="Вставь полный docker-compose.yml из Remnawave">{html.escape(compose_text)}</textarea><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Подключить каталог сертификатов к контейнеру</label><button>Проверить и сохранить</button></form><p class="mono muted">Каталог: /opt/remnanode · SHA-256: {html.escape(s['compose_hash'])}. Сохранение ещё не запускает контейнер.</p></section>
+<section class="card wide"><div class="label">Access logs</div><h2>Передавать подключения в Meltun</h2><form method="post" action="{web_path('access-forwarder')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label>ID ноды</label><input name="node_id" value="{html.escape(forwarder_config.get('node_id', ''))}" placeholder="de-1" required><label>HTTPS endpoint</label><input name="endpoint" value="https://meltun.org/api/admin/node-logs/ingest" required><label>Часовой пояс логов Xray</label><select name="log_timezone"><option value="UTC" {'selected' if forwarder_config.get('log_timezone', 'UTC') == 'UTC' else ''}>UTC</option><option value="Europe/Moscow" {'selected' if forwarder_config.get('log_timezone') == 'Europe/Moscow' else ''}>Europe/Moscow</option></select><label>Ключ из веб-админки Meltun</label><input name="token" type="password" autocomplete="off" placeholder="Вставьте выданный ключ" required><button>Сохранить и запустить сбор</button></form><p class="muted">Откройте Node Forge через HTTPS или SSH-туннель перед вводом ключа. В конфигурационном профиле Xray панели задайте log.access = /var/log/remnanode/access.log. Изменение Compose-монтирования требует пересоздания контейнера.</p></section>
 <section class="card"><div class="label">02 / Certificate · optional</div><h2>Выпустить сертификат</h2><form method="post" action="{web_path('cert')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label>Домен</label><input name="domain" placeholder="node.example.com" required><label>IP сервера для проверки DNS</label><select name="expected_ip" required>{address_options}</select><p class="muted">Выбранный адрес сравнивается с A/AAAA домена. Если записей несколько, для надёжного HTTP-01 каждый опубликованный адрес должен принимать запросы этого домена на порту 80.</p><label>Email Let's Encrypt</label><input type="email" name="email" required><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Добавить volume в сохранённый Compose</label><label class="check"><input type="checkbox" name="restart_node" value="1"> Перезапустить уже работающую ноду</label><label class="check"><input type="checkbox" name="force_dns" value="1"> Игнорировать несовпадение выбранного IP и DNS</label><button>Проверить DNS и выпустить</button></form></section>
 <section class="card full"><div class="label">03 / Installation</div><h2>Выбрать версию и установить</h2><form id="install-form" action="{web_path('api/install')}" method="post"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Версия образа</label><select name="version">{tag_options}</select></div><div style="align-self:end"><button id="install-button">Начать установку</button></div></div></form><div class="pipeline"><div class="stage"><small>01 Compose</small><b id="step-compose">{'готов' if COMPOSE_FILE.exists() else 'не сохранён'}</b></div><div class="stage"><small>02 Image</small><b id="step-image">{html.escape(job.get('tag') or selected_tag)}</b></div><div class="stage"><small>03 Deploy</small><b id="step-deploy">{html.escape(job.get('phase','idle'))}</b></div><div class="stage"><small>04 Runtime</small><b id="step-runtime">{html.escape(s['state'])}</b></div></div><p id="install-message" class="mono muted">{html.escape(job.get('message','Installation has not started.'))}</p><pre id="install-log">{html.escape(job.get('log','') or 'Здесь появится ход загрузки образа и запуска контейнера.')}</pre></section>
 <section class="card full"><div class="label">04 / Profile builder</div><h2>Сгенерировать inbound</h2><form method="post" action="{web_path('inbound')}"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Тип</label><select name="kind"><option value="reality">VLESS TCP Reality + self-steal</option><option value="hysteria">Hysteria 2 TLS</option></select></div><div><label>Tag</label><input name="tag" value="VLESS_REALITY"></div><div><label>Порт</label><input type="number" min="1" max="65535" name="inbound_port" value="2053"></div><div><label>Домен</label><input name="inbound_domain" placeholder="node.example.com" required></div></div><button>Сгенерировать inbound</button></form>{inbound}</section>
@@ -1385,8 +1425,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "Authentication required."}, 401) if is_api else self.send_html(render_login(), 401)
         if not hmac.compare_digest(form.get("csrf", [""])[0], csrf_token()):
             return self.send_json({"error": "CSRF validation failed."}, 403) if is_api else self.redirect(error="CSRF validation failed.")
+        if path == "/access-forwarder" and not (self.headers.get("X-Forwarded-Proto") == "https" or (self.client_address[0] in ("127.0.0.1", "::1") and "X-Forwarded-For" not in self.headers)):
+            return self.redirect(error="Open Node Forge over HTTPS or an SSH tunnel before sending the node token.")
         try:
             if path == "/compose": message = apply_compose(form)
+            elif path == "/access-forwarder": message = configure_access_forwarder(form)
             elif path == "/cert": message = issue_certificate(form)
             elif path == "/network": message = apply_network(form)
             elif path == "/ssh": message = apply_ssh_access(form)
@@ -1410,6 +1453,154 @@ if __name__ == "__main__":
     ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
 PY
 chmod 0750 /opt/remnanode-manager/app.py
+
+cat > /opt/remnanode-manager/access_forwarder.py <<'PY'
+#!/usr/bin/env python3
+"""Forward Xray access events with a durable offset and idempotent event IDs."""
+import datetime
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import time
+import urllib.request
+from pathlib import Path
+
+CONFIG = Path("/etc/remnanode-access-forwarder.json")
+STATE = Path("/var/lib/remnanode-manager/access-forwarder-state.json")
+SOURCE = Path("/var/log/remnanode/access.log")
+LINE = re.compile(r"^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d(?:\.\d+)?) from (\[[^]]+\]|[^\s:]+):\d+ accepted (tcp|udp):([^\s]+).*? email: ([^\s]+)")
+
+
+def parse_line(raw, inode, offset, log_timezone="UTC"):
+    match = LINE.search(raw)
+    if not match:
+        return None
+    stamp, source, network, destination, username = match.groups()
+    route_match = re.search(r"\[([^]]+)\]\s+email:", raw)
+    route = route_match.group(1) if route_match else ""
+    try:
+        source = str(ipaddress.ip_address(source.strip("[]")))
+        occurred = datetime.datetime.strptime(stamp.split(".")[0], "%Y/%m/%d %H:%M:%S")
+    except ValueError:
+        return None
+    if username == "-" or not username:
+        return None
+    identity = hashlib.sha256(f"{inode}:{offset}:{raw}".encode()).hexdigest()
+    zone = datetime.timezone(datetime.timedelta(hours=3)) if log_timezone == "Europe/Moscow" else datetime.timezone.utc
+    return {
+        "event_id": identity, "occurred_at": occurred.replace(tzinfo=zone).astimezone(datetime.timezone.utc).isoformat(),
+        "panel_username": username[:255], "source_ip": source,
+        "destination": destination[:255], "network": network, "route": (route or "")[:255],
+    }
+
+
+def load_state():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(inode, offset):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = STATE.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"inode": inode, "offset": offset}))
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, STATE)
+
+
+def send_batch(config, events):
+    data = json.dumps({"node_id": config["node_id"], "events": events}).encode()
+    request = urllib.request.Request(
+        config["endpoint"], data=data,
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + config["token"]},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        if response.status != 200:
+            raise RuntimeError(f"Unexpected response: {response.status}")
+
+
+def main():
+    while True:
+        try:
+            config = json.loads(CONFIG.read_text())
+            if config.get("endpoint") != "https://meltun.org/api/admin/node-logs/ingest":
+                raise ValueError("Invalid endpoint")
+            stat = SOURCE.stat()
+            state = load_state()
+            inode = stat.st_ino
+            # First activation starts at the current tail; rotation or truncation starts at zero.
+            offset = stat.st_size if not state else (state.get("offset", 0) if state.get("inode") == inode and stat.st_size >= state.get("offset", 0) else 0)
+            if not state:
+                save_state(inode, offset)
+            events = []
+            with SOURCE.open("rb") as stream:
+                stream.seek(offset)
+                for _ in range(200):
+                    start = stream.tell()
+                    raw = stream.readline()
+                    if not raw or not raw.endswith(b"\n"):
+                        break
+                    offset = stream.tell()
+                    event = parse_line(raw.decode("utf-8", "replace").strip(), inode, start, config.get("log_timezone", "UTC"))
+                    if event:
+                        events.append(event)
+            if events:
+                send_batch(config, events)
+            save_state(inode, offset)
+            if len(events) < 200:
+                time.sleep(2)
+        except (OSError, ValueError, KeyError, RuntimeError) as exc:
+            print(f"Access forwarder waiting: {exc}", flush=True)
+            time.sleep(10)
+        except Exception as exc:
+            print(f"Access forwarder retrying: {type(exc).__name__}: {exc}", flush=True)
+            time.sleep(10)
+
+
+if __name__ == "__main__":
+    main()
+PY
+chmod 0750 /opt/remnanode-manager/access_forwarder.py
+
+cat > /etc/systemd/system/remnanode-access-forwarder.service <<'UNIT'
+[Unit]
+Description=Forward RemnaNode Xray access logs to Meltun
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/remnanode-manager/access_forwarder.py
+Restart=always
+RestartSec=5
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/remnanode-manager
+ReadOnlyPaths=/var/log/remnanode /etc/remnanode-access-forwarder.json
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > /etc/logrotate.d/remnanode-access <<'ROTATE'
+/var/log/remnanode/access.log /var/log/remnanode/error.log {
+    daily
+    rotate 30
+    missingok
+    notifempty
+    compress
+    copytruncate
+    su root root
+}
+ROTATE
 
 cat > /usr/local/sbin/remnanode-sync-certs <<'SH'
 #!/usr/bin/env bash
@@ -1478,6 +1669,10 @@ UNIT
 systemctl daemon-reload
 systemctl enable remnanode-manager.service
 systemctl restart remnanode-manager.service
+if [[ -f /etc/remnanode-access-forwarder.json ]]; then
+  systemctl enable --now remnanode-access-forwarder.service
+  systemctl restart remnanode-access-forwarder.service
+fi
 
 admin_password=$(sed -n 's/^RNM_ADMIN_PASSWORD=//p' /etc/remnanode-manager.env)
 manager_path=$(sed -n 's/^RNM_BASE_PATH=//p' /etc/remnanode-manager.env)
