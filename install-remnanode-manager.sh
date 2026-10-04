@@ -34,6 +34,7 @@ install -d -m 0755 /var/log/remnanode
 
 cat > /opt/remnanode-manager/app.py <<'PY'
 #!/usr/bin/env python3
+import calendar
 import hashlib
 import hmac
 import html
@@ -77,19 +78,25 @@ SSH_SOCKET_OVERRIDE = Path("/etc/systemd/system/ssh.socket.d/90-remnanode-manage
 MANAGED_ROOT_AUTHORIZED_KEYS = STATE_DIR / "root-authorized_keys"
 ROOT_AUTHORIZED_KEYS = Path("/root/.ssh/authorized_keys")
 ADMIN_PASSWORD = os.environ["RNM_ADMIN_PASSWORD"]
-SESSION_SECRET = os.environ["RNM_SESSION_SECRET"].encode()
 BIND = os.getenv("RNM_BIND", "127.0.0.1")
 PORT = int(os.getenv("RNM_PORT", "8765"))
 BASE_PATH = "/" + os.environ["RNM_BASE_PATH"].strip("/")
 DOMAIN_RE = re.compile(r"(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 TAG_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}$")
 SSH_KEY_RE = re.compile(r"^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)\s+([A-Za-z0-9+/]+={0,3})(?:\s+.*)?$")
+SESSION_TTL = 12 * 3600
+LOGIN_LIMIT = 5
 attempts = {}
+attempts_guard = threading.Lock()
+sessions = {}
+sessions_guard = threading.Lock()
+cache = {}
+cache_guard = threading.Lock()
 install_guard = threading.Lock()
 install_state_guard = threading.Lock()
 install_state = {
-    "phase": "idle", "message": "Installation has not started.",
-    "tag": "", "started": 0, "finished": 0, "log": "",
+    "phase": "idle", "message": "Установка ещё не запускалась.",
+    "tag": "", "started": 0, "finished": 0, "log": "", "failed_phase": "",
 }
 
 NETWORK_KEYS = [
@@ -106,8 +113,22 @@ def run(args, *, cwd=None, timeout=300, check=True):
         stderr=subprocess.STDOUT, timeout=timeout, check=False,
     )
     if check and result.returncode:
-        raise RuntimeError(result.stdout.strip()[-4000:] or f"Command failed: {args[0]}")
+        raise RuntimeError(result.stdout.strip()[-4000:] or f"Команда завершилась с ошибкой: {args[0]}")
     return result.stdout.strip()
+
+
+def cached(key, ttl, producer):
+    """Return a memoised value; ttl may be a callable that inspects the value."""
+    now = time.monotonic()
+    with cache_guard:
+        item = cache.get(key)
+        if item and now < item[0]:
+            return item[1]
+    value = producer()
+    lifetime = ttl(value) if callable(ttl) else ttl
+    with cache_guard:
+        cache[key] = (time.monotonic() + lifetime, value)
+    return value
 
 
 def normalize_ip(value):
@@ -117,13 +138,17 @@ def normalize_ip(value):
         return ""
 
 
-def public_egress_ip(timeout=4):
+def fetch_public_ip(timeout=4):
     try:
         return normalize_ip(
             urllib.request.urlopen("https://api.ipify.org", timeout=timeout).read().decode()
         ) or "unknown"
     except Exception:
         return "unknown"
+
+
+def public_egress_ip():
+    return cached("public_ip", lambda value: 60 if value == "unknown" else 900, fetch_public_ip)
 
 
 def server_addresses(include_public=True, public_ip=None):
@@ -168,7 +193,7 @@ def resolve_domain_addresses(domain):
     try:
         answers = socket.getaddrinfo(domain, 80, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
-        raise ValueError(f"DNS lookup failed for {domain}: {exc}.") from exc
+        raise ValueError(f"Не удалось получить DNS-записи {domain}: {exc}.") from exc
     for answer in answers:
         value = normalize_ip(answer[4][0])
         if value:
@@ -220,13 +245,13 @@ def run_live(args, *, cwd=None, timeout=1200):
             install_log(line)
             if time.monotonic() - started > timeout:
                 process.kill()
-                raise RuntimeError(f"Command timed out: {args[0]}")
+                raise RuntimeError(f"Превышено время ожидания команды: {args[0]}")
         code = process.wait(timeout=15)
     finally:
         if process.poll() is None:
             process.kill()
     if code:
-        raise RuntimeError(f"Command failed with exit code {code}: {' '.join(args)}")
+        raise RuntimeError(f"Команда завершилась с кодом {code}: {' '.join(args)}")
 
 
 def backup(paths, label):
@@ -276,7 +301,7 @@ def ssh_config_files():
 def ensure_sshd_runtime():
     runtime = Path("/run/sshd")
     if runtime.exists() and not runtime.is_dir():
-        raise RuntimeError("/run/sshd exists but is not a directory.")
+        raise RuntimeError("/run/sshd существует, но это не каталог.")
     runtime.mkdir(parents=True, exist_ok=True)
     os.chown(runtime, 0, 0)
     os.chmod(runtime, 0o755)
@@ -313,7 +338,7 @@ def restore_ssh_configuration(target):
     target = Path(target)
     manifest_file = target / "manifest.json"
     if not manifest_file.exists() or BACKUP_DIR not in target.parents:
-        raise ValueError("SSH backup is missing or invalid.")
+        raise ValueError("Резервная копия SSH не найдена или повреждена.")
     payload = json.loads(manifest_file.read_text(encoding="utf-8"))
     manifest = payload.get("files", []) if isinstance(payload, dict) else payload
     for destination in (SSH_MANAGED_CONFIG, SSH_SOCKET_OVERRIDE, MANAGED_ROOT_AUTHORIZED_KEYS):
@@ -324,7 +349,7 @@ def restore_ssh_configuration(target):
             continue
         source = target / str(destination).lstrip("/")
         if not source.exists():
-            raise RuntimeError(f"Backup file is missing: {source}")
+            raise RuntimeError(f"В резервной копии нет файла: {source}")
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
 
@@ -387,7 +412,7 @@ def ssh_service_name():
 def write_ssh_managed_config(ports, password_auth):
     unique_ports = sorted({int(port) for port in ports})
     if not unique_ports or any(not 1 <= port <= 65535 for port in unique_ports):
-        raise ValueError("SSH port must be between 1 and 65535.")
+        raise ValueError("SSH-порт должен быть в диапазоне 1–65535.")
     auth = "yes" if password_auth else "no"
     root_login = "yes" if password_auth else "prohibit-password"
     body = "# Managed by RemnaNode Node Forge.\n"
@@ -420,7 +445,7 @@ def verify_ssh_auth_settings(password_auth):
     if str(MANAGED_ROOT_AUTHORIZED_KEYS) not in authorized_files or ".ssh/authorized_keys" not in authorized_files:
         mismatches.append(f"authorizedkeysfile={effective.get('authorizedkeysfile', 'missing')}")
     if mismatches:
-        raise RuntimeError("OpenSSH ignored the requested authentication settings: " + ", ".join(mismatches))
+        raise RuntimeError("OpenSSH не применил настройки входа: " + ", ".join(mismatches))
 
 
 def reload_ssh_stack():
@@ -443,12 +468,12 @@ def validate_public_key(value):
     if not value:
         return ""
     if len(value) > 16384 or not SSH_KEY_RE.fullmatch(value):
-        raise ValueError("Paste one complete OpenSSH public key, for example ssh-ed25519 AAAA... comment.")
+        raise ValueError("Вставьте один полный публичный ключ OpenSSH, например ssh-ed25519 AAAA... comment.")
     probe = Path("/run") / f"node-forge-key-{secrets.token_hex(6)}"
     try:
         atomic_write(probe, value + "\n", 0o600)
         if not command_ok(["ssh-keygen", "-lf", str(probe)]):
-            raise ValueError("ssh-keygen rejected this public key.")
+            raise ValueError("ssh-keygen не принял этот публичный ключ.")
     finally:
         probe.unlink(missing_ok=True)
     return value
@@ -488,12 +513,55 @@ def web_path(suffix=""):
     return BASE_PATH + "/" + suffix
 
 
-def session_token():
-    return hmac.new(SESSION_SECRET, b"admin-session-v1", hashlib.sha256).hexdigest()
+def create_session():
+    """Issue a random per-login session; each one carries its own CSRF token."""
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with sessions_guard:
+        for key in [key for key, value in sessions.items() if value["expires"] < now]:
+            sessions.pop(key, None)
+        sessions[token] = {"expires": now + SESSION_TTL, "csrf": secrets.token_urlsafe(32)}
+    return token
 
 
-def csrf_token():
-    return hmac.new(SESSION_SECRET, (session_token() + ":csrf").encode(), hashlib.sha256).hexdigest()
+def get_session(token):
+    if not token:
+        return None
+    now = time.time()
+    with sessions_guard:
+        session = sessions.get(token)
+        if not session:
+            return None
+        if session["expires"] < now:
+            sessions.pop(token, None)
+            return None
+        session["expires"] = now + SESSION_TTL
+        return dict(session)
+
+
+def drop_session(token):
+    with sessions_guard:
+        sessions.pop(token, None)
+
+
+def login_allowed(ip, now=None):
+    now = time.time() if now is None else now
+    with attempts_guard:
+        for key in list(attempts):
+            attempts[key] = [stamp for stamp in attempts[key] if now - stamp < 60]
+            if not attempts[key]:
+                del attempts[key]
+        return len(attempts.get(ip, [])) < LOGIN_LIMIT
+
+
+def record_login_failure(ip, now=None):
+    with attempts_guard:
+        attempts.setdefault(ip, []).append(time.time() if now is None else now)
+
+
+def reset_login_failures(ip):
+    with attempts_guard:
+        attempts.pop(ip, None)
 
 
 def redact(text):
@@ -513,7 +581,8 @@ def load_install_state():
             if install_state.get("phase") in {"queued", "pulling", "starting", "verifying"}:
                 install_state.update({
                     "phase": "interrupted",
-                    "message": "The manager restarted while installation was running. Start it again.",
+                    "failed_phase": install_state.get("phase"),
+                    "message": "Панель перезапустилась во время установки. Запустите установку ещё раз.",
                     "finished": int(time.time()),
                 })
     except Exception:
@@ -553,12 +622,13 @@ def status_data():
     }
 
 
-def image_tags():
+def fetch_image_tags():
+    """Return (tags, fetched_from_docker_hub)."""
     tags = ["latest"]
     try:
         request = urllib.request.Request(
             "https://hub.docker.com/v2/repositories/remnawave/node/tags?page_size=50&ordering=last_updated",
-            headers={"User-Agent": "RemnaNode-Node-Forge/1.1"},
+            headers={"User-Agent": "RemnaNode-Node-Forge/2.0"},
         )
         payload = json.loads(urllib.request.urlopen(request, timeout=6).read().decode())
         names = [item.get("name", "") for item in payload.get("results", [])]
@@ -567,20 +637,34 @@ def image_tags():
         tags.extend(stable)
         if "dev" in names:
             tags.append("dev")
+        return list(dict.fromkeys(tags)), True
     except Exception:
         tags.extend(["3.4.1", "dev"])
-    return list(dict.fromkeys(tags))
+        return list(dict.fromkeys(tags)), False
+
+
+def image_tags():
+    tags, _fresh = cached("image_tags", lambda value: 1800 if value[1] else 120, fetch_image_tags)
+    return tags
+
+
+def warm_caches():
+    for producer in (public_egress_ip, image_tags):
+        try:
+            producer()
+        except Exception:
+            pass
 
 
 def ensure_cert_volume(config):
     if not isinstance(config, dict) or not isinstance(config.get("services"), dict):
-        raise ValueError("Compose must contain a services object.")
+        raise ValueError("В Compose должен быть раздел services.")
     service = config["services"].get("remnanode")
     if not isinstance(service, dict):
-        raise ValueError("Service remnanode was not found.")
+        raise ValueError("Сервис remnanode не найден.")
     volumes = service.setdefault("volumes", [])
     if not isinstance(volumes, list):
-        raise ValueError("remnanode.volumes must be a list.")
+        raise ValueError("remnanode.volumes должен быть списком.")
     mount = "/var/lib/remnawave/configs/xray/ssl:/var/lib/remnawave/configs/xray/ssl:ro"
     host_ssl_dir = str(SSL_DIR).replace("\\", "/")
     if not any(isinstance(item, str) and item.split(":", 1)[0] == host_ssl_dir for item in volumes):
@@ -592,10 +676,10 @@ def ensure_cert_volume(config):
 def ensure_log_volume(config):
     service = config.get("services", {}).get("remnanode") if isinstance(config, dict) else None
     if not isinstance(service, dict):
-        raise ValueError("Service remnanode was not found.")
+        raise ValueError("Сервис remnanode не найден.")
     volumes = service.setdefault("volumes", [])
     if not isinstance(volumes, list):
-        raise ValueError("remnanode.volumes must be a list.")
+        raise ValueError("remnanode.volumes должен быть списком.")
     host_dir = str(XRAY_LOG_DIR)
     mount = f"{host_dir}:{host_dir}"
     if not any(isinstance(item, str) and item.split(":", 1)[0] == host_dir for item in volumes):
@@ -620,22 +704,22 @@ def write_compose(config, label):
 def apply_compose(form):
     raw = form.get("compose", [""])[0].strip()
     if not raw:
-        raise ValueError("Paste docker-compose.yml first.")
+        raise ValueError("Сначала вставьте docker-compose.yml.")
     if len(raw.encode()) > 900_000:
-        raise ValueError("Compose file is too large.")
+        raise ValueError("Файл Compose слишком большой.")
     config = yaml.safe_load(raw)
     if form.get("cert_volume") == ["1"]:
         ensure_cert_volume(config)
     else:
         if not isinstance(config, dict) or not isinstance(config.get("services"), dict) or not isinstance(config["services"].get("remnanode"), dict):
-            raise ValueError("Compose must contain services.remnanode.")
+            raise ValueError("В Compose должен быть сервис services.remnanode.")
     saved = write_compose(config, "compose")
-    return f"Compose validated and saved. Choose a RemnaNode version, then start installation. Backup: {saved}"
+    return f"Compose проверен и сохранён. Теперь выберите версию RemnaNode и запустите установку. Резервная копия: {saved}"
 
 
 def redeem_pair_code(node_id, code):
     if not re.fullmatch(r"[A-Za-z0-9_-]{32,64}", code):
-        raise ValueError("Enter a valid one-time pairing code.")
+        raise ValueError("Введите корректный одноразовый код подключения.")
     request = urllib.request.Request(
         "https://meltun.org/api/admin/node-logs/pair",
         data=json.dumps({"node_id": node_id, "code": code}).encode(),
@@ -652,10 +736,10 @@ def redeem_pair_code(node_id, code):
             except (ValueError, AttributeError):
                 detail = ""
             raise ValueError(str(detail)[:300] or "Проверьте ID ноды, код и публичный IP в MelTun.") from exc
-        raise RuntimeError(f"Meltun pairing failed (HTTP {exc.code}).") from exc
+        raise RuntimeError(f"MelTun не подключил ноду (HTTP {exc.code}).") from exc
     token = payload.get("token", "")
     if not re.fullmatch(r"[a-zA-Z0-9_-]{40,128}", token):
-        raise RuntimeError("Meltun returned an invalid node token.")
+        raise RuntimeError("MelTun вернул некорректный токен ноды.")
     return token
 
 
@@ -666,36 +750,41 @@ def configure_access_forwarder(form):
     pair_code = form.get("pair_code", [""])[0].strip()
     log_timezone = form.get("log_timezone", ["UTC"])[0].strip()
     if endpoint != "https://meltun.org/api/admin/node-logs/ingest":
-        raise ValueError("Endpoint must be https://meltun.org/api/admin/node-logs/ingest")
+        raise ValueError("Адрес приёма должен быть https://meltun.org/api/admin/node-logs/ingest")
     if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,80}", node_id):
-        raise ValueError("Node ID may contain only letters, digits, dots, underscores and hyphens.")
+        raise ValueError("ID ноды может содержать только латинские буквы, цифры, точки, подчёркивания и дефисы.")
     if log_timezone not in ("UTC", "Europe/Moscow"):
-        raise ValueError("Unsupported Xray log timezone.")
+        raise ValueError("Неподдерживаемый часовой пояс логов Xray.")
     if pair_code:
         token = redeem_pair_code(node_id, pair_code)
     elif not re.fullmatch(r"[a-zA-Z0-9_-]{40,128}", token):
-        raise ValueError("Enter the one-time pairing code from Meltun web admin.")
+        raise ValueError("Введите одноразовый код из веб-админки MelTun.")
     atomic_write(ACCESS_FORWARDER_CONFIG, json.dumps({"endpoint": endpoint, "node_id": node_id, "token": token, "log_timezone": log_timezone}), mode=0o600)
     run(["systemctl", "enable", "--now", "remnanode-access-forwarder.service"])
     run(["systemctl", "restart", "remnanode-access-forwarder.service"])
-    return "Node paired and Xray access-log forwarding configured. Check its last-seen time in Meltun web admin."
+    return "Нода подключена, передача access log Xray настроена. Проверьте «Последний пакет» в веб-админке MelTun."
 
 
 def install_worker(tag):
     try:
         with install_guard:
             save_install_state(
-                phase="pulling", message=f"Downloading remnawave/node:{tag}",
-                started=int(time.time()), finished=0, tag=tag, log="",
+                phase="pulling", message=f"Загружаю образ remnawave/node:{tag}",
+                started=int(time.time()), finished=0, tag=tag, log="", failed_phase="",
             )
-            install_log(f"Selected image: remnawave/node:{tag}")
+            install_log(f"Выбран образ: remnawave/node:{tag}")
+            if any(site["public_https"] for site in managed_sites()):
+                install_log(
+                    "ВНИМАНИЕ: nginx держит публичный TCP 443 для HTTPS-сайта. Если inbound Xray "
+                    "слушает 443, отключите публичный 443 в разделе «Сертификаты», иначе нода не запустится."
+                )
             run_live(["docker", "pull", f"remnawave/node:{tag}"], timeout=1200)
-            save_install_state(phase="starting", message="Creating and starting the RemnaNode container.")
+            save_install_state(phase="starting", message="Создаю и запускаю контейнер RemnaNode.")
             run_live(
                 ["docker", "compose", "up", "-d", "--force-recreate", "remnanode"],
                 cwd=COMPOSE_DIR, timeout=600,
             )
-            save_install_state(phase="verifying", message="Waiting for the container to enter running state.")
+            save_install_state(phase="verifying", message="Жду, пока контейнер перейдёт в состояние running.")
             deadline = time.monotonic() + 90
             state = "unknown"
             while time.monotonic() < deadline:
@@ -709,42 +798,43 @@ def install_worker(tag):
             if state != "running":
                 tail = run(["docker", "logs", "--tail", "80", "remnanode"], check=False, timeout=20)
                 install_log(tail)
-                raise RuntimeError(f"Container did not reach running state (current state: {state or 'missing'}).")
+                raise RuntimeError(f"Контейнер не перешёл в состояние running (сейчас: {state or 'отсутствует'}).")
             image = run(
                 ["docker", "inspect", "remnanode", "--format", "{{.Config.Image}}"],
                 check=False, timeout=15,
             ).strip()
-            install_log(f"RemnaNode is running with image {image or f'remnawave/node:{tag}'}.")
+            install_log(f"RemnaNode работает на образе {image or f'remnawave/node:{tag}'}.")
             save_install_state(
-                phase="installed", message=f"RemnaNode {tag} is installed and running.",
+                phase="installed", message=f"RemnaNode {tag} установлена и работает.",
                 finished=int(time.time()),
             )
     except Exception as exc:
-        install_log(f"ERROR: {exc}")
+        install_log(f"ОШИБКА: {exc}")
         save_install_state(
-            phase="failed", message=str(exc)[-1000:], finished=int(time.time()),
+            phase="failed", failed_phase=install_snapshot().get("phase", ""),
+            message=str(exc)[-1000:], finished=int(time.time()),
         )
 
 
 def start_install(form):
     tag = form.get("version", ["latest"])[0].strip()
     if not TAG_RE.fullmatch(tag):
-        raise ValueError("Invalid image tag.")
+        raise ValueError("Некорректный тег образа.")
     if not COMPOSE_FILE.exists():
-        raise ValueError("Save Docker Compose before starting installation.")
+        raise ValueError("Сначала сохраните Docker Compose.")
     if install_guard.locked() or install_snapshot().get("phase") in {"queued", "pulling", "starting", "verifying"}:
-        raise ValueError("Installation is already running.")
+        raise ValueError("Установка уже выполняется.")
     config = yaml.safe_load(COMPOSE_FILE.read_text(encoding="utf-8"))
     if not isinstance(config, dict) or not isinstance(config.get("services"), dict):
-        raise ValueError("Compose must contain services.remnanode.")
+        raise ValueError("В Compose должен быть сервис services.remnanode.")
     service = config["services"].get("remnanode")
     if not isinstance(service, dict):
-        raise ValueError("Service remnanode was not found.")
+        raise ValueError("Сервис remnanode не найден.")
     service["image"] = f"remnawave/node:{tag}"
     write_compose(config, f"version-{tag}")
     save_install_state(
-        phase="queued", message=f"Installation of remnawave/node:{tag} is queued.",
-        tag=tag, started=int(time.time()), finished=0, log="",
+        phase="queued", message=f"Установка remnawave/node:{tag} поставлена в очередь.",
+        tag=tag, started=int(time.time()), finished=0, log="", failed_phase="",
     )
     threading.Thread(target=install_worker, args=(tag,), daemon=True, name="remnanode-install").start()
     return install_snapshot()
@@ -787,13 +877,96 @@ def nginx_http_config(domain):
 '''
 
 
+def parse_port_owners(output):
+    owners = set()
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        names = re.findall(r'"([^"]+)",pid=', line)
+        owners.update(names or ["unknown"])
+    return owners
+
+
+def port_owners(port):
+    """Process names listening on TCP port, e.g. {"nginx"} or {"xray"}."""
+    return parse_port_owners(run(["ss", "-H", "-lntp", f"sport = :{int(port)}"], check=False, timeout=10))
+
+
 def nginx_can_serve_public_https():
-    listeners = run(["ss", "-H", "-lntp"], check=False, timeout=10)
-    port_443 = [
-        line for line in listeners.splitlines()
-        if re.search(r"(?:^|[\[\]:.])443\s", line)
-    ]
-    return not port_443 or all('"nginx"' in line for line in port_443)
+    owners = port_owners(443)
+    return not owners or owners == {"nginx"}
+
+
+def set_public_https(current, enabled):
+    """Add or remove the public 443 listeners of a Node Forge TLS site."""
+    listeners = "    listen 443 ssl;\n    listen [::]:443 ssl;\n"
+    marker = "    # Internal endpoint used as the REALITY self-steal target.\n"
+    if marker not in current:
+        raise RuntimeError("Сайт не похож на TLS-сайт Node Forge.")
+    without = current.replace(listeners + marker, marker)
+    return without.replace(marker, listeners + marker, 1) if enabled else without
+
+
+def certificate_days_left(domain):
+    path = SSL_DIR / f"{domain}.pem"
+    if not path.exists():
+        return None
+    output = run(["openssl", "x509", "-enddate", "-noout", "-in", str(path)], check=False, timeout=10)
+    value = output.partition("=")[2].strip()
+    try:
+        expires = calendar.timegm(time.strptime(value, "%b %d %H:%M:%S %Y %Z"))
+    except ValueError:
+        return None
+    return int((expires - time.time()) // 86400)
+
+
+def managed_sites():
+    sites = []
+    for available in sorted(Path("/etc/nginx/sites-available").glob("rnm-*.conf")):
+        domain = available.name[4:-5]
+        if not DOMAIN_RE.fullmatch(domain):
+            continue
+        try:
+            text = available.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        tls = "# Internal endpoint used as the REALITY self-steal target." in text
+        sites.append({
+            "domain": domain, "tls": tls,
+            "public_https": tls and "listen 443 ssl;" in text,
+            "days_left": certificate_days_left(domain),
+        })
+    return sites
+
+
+def toggle_public_https(form):
+    domain = form.get("domain", [""])[0].strip().lower()
+    enabled = form.get("enabled") == ["1"]
+    if not DOMAIN_RE.fullmatch(domain):
+        raise ValueError("Некорректный домен.")
+    available = Path("/etc/nginx/sites-available") / f"rnm-{domain}.conf"
+    if not available.exists():
+        raise ValueError(f"Сайт {domain} не создан Node Forge.")
+    if enabled:
+        owners = port_owners(443) - {"nginx"}
+        if owners:
+            raise ValueError(f"TCP 443 уже занят: {', '.join(sorted(owners))}. Сначала уберите inbound с порта 443.")
+    current = available.read_text(encoding="utf-8")
+    candidate = set_public_https(current, enabled)
+    if candidate == current:
+        return f"Публичный HTTPS для {domain} уже {'включён' if enabled else 'выключен'}."
+    backup([available], f"public-https-{domain}")
+    try:
+        atomic_write(available, candidate, 0o644)
+        run(["nginx", "-t"], timeout=20)
+        run(["systemctl", "reload", "nginx"], timeout=20)
+    except Exception:
+        atomic_write(available, current, 0o644)
+        run(["systemctl", "reload", "nginx"], check=False, timeout=20)
+        raise
+    if enabled:
+        return f"Сайт {domain} и панель доступны по HTTPS на TCP 443."
+    return f"nginx освободил публичный TCP 443 для {domain}; TLS-заглушка Reality осталась на 127.0.0.1:8443."
 
 
 def nginx_manager_location():
@@ -847,7 +1020,7 @@ def add_manager_location(current):
     tls_start = current.index("# Internal endpoint used as the REALITY self-steal target.")
     insert_at = current.find(marker, tls_start)
     if insert_at < 0:
-        raise RuntimeError("Cannot find TLS fallback location in the managed site")
+        raise RuntimeError("Не найден location TLS-заглушки в управляемом сайте")
     return current[:insert_at] + nginx_manager_location() + current[insert_at:]
 
 
@@ -976,7 +1149,7 @@ def create_decoy_site(domain):
 def sync_certificate(domain):
     lineage = Path("/etc/letsencrypt/live") / domain
     if not (lineage / "fullchain.pem").exists():
-        raise RuntimeError("Let's Encrypt files were not created.")
+        raise RuntimeError("Let's Encrypt не создал файлы сертификата.")
     shutil.copyfile(lineage / "fullchain.pem", SSL_DIR / f"{domain}.pem", follow_symlinks=True)
     shutil.copyfile(lineage / "privkey.pem", SSL_DIR / f"{domain}.key", follow_symlinks=True)
     os.chmod(SSL_DIR / f"{domain}.pem", 0o644)
@@ -988,24 +1161,31 @@ def issue_certificate(form):
     email = form.get("email", [""])[0].strip()
     selected_ip = normalize_ip(form.get("expected_ip", [""])[0])
     if not DOMAIN_RE.fullmatch(domain):
-        raise ValueError("Enter a valid public domain name.")
+        raise ValueError("Введите корректный публичный домен.")
     if "@" not in email or len(email) > 254:
-        raise ValueError("Enter a valid email address.")
+        raise ValueError("Введите корректный email.")
     available_ips = {entry["value"] for entry in server_addresses()}
     if not selected_ip:
-        raise ValueError("Choose the server IP address that the domain must resolve to.")
+        raise ValueError("Выберите IP сервера, на который должен указывать домен.")
     if selected_ip not in available_ips:
-        raise ValueError("The selected IP is no longer present on this server. Refresh the page and choose again.")
+        raise ValueError("Выбранного IP больше нет на сервере. Обновите страницу и выберите снова.")
     addresses = resolve_domain_addresses(domain)
     dns_forced = form.get("force_dns") == ["1"]
     if selected_ip not in addresses and not dns_forced:
-        resolved = ", ".join(addresses) or "nothing"
-        raise ValueError(f"DNS for {domain} points to {resolved}; selected server IP is {selected_ip}.")
+        resolved = ", ".join(addresses) or "пустоту"
+        raise ValueError(f"DNS {domain} указывает на {resolved}, а выбран IP сервера {selected_ip}.")
     create_decoy_site(domain)
     available = Path("/etc/nginx/sites-available") / f"rnm-{domain}.conf"
     enabled = Path("/etc/nginx/sites-enabled") / available.name
     backup([available], f"nginx-{domain}")
-    atomic_write(available, nginx_http_config(domain), 0o644)
+    current = available.read_text(encoding="utf-8") if available.exists() else ""
+    marker = "# Internal endpoint used as the REALITY self-steal target."
+    has_live_tls = marker in current and (Path("/etc/letsencrypt/live") / domain / "fullchain.pem").exists()
+    previous_public = has_live_tls and "listen 443 ssl;" in current
+    # An existing TLS site already answers ACME on port 80; keep it so the
+    # REALITY fallback on 127.0.0.1:8443 stays up while certbot runs.
+    if not has_live_tls:
+        atomic_write(available, nginx_http_config(domain), 0o644)
     if not enabled.exists():
         enabled.symlink_to(available)
     run(["nginx", "-t"], timeout=20)
@@ -1016,7 +1196,8 @@ def issue_certificate(form):
         "--keep-until-expiring",
     ], timeout=600)
     sync_certificate(domain)
-    public_https = nginx_can_serve_public_https()
+    requested_public = form.get("public_https") == ["1"] or previous_public
+    public_https = requested_public and nginx_can_serve_public_https()
     atomic_write(available, nginx_tls_config(domain, public_https), 0o644)
     run(["nginx", "-t"], timeout=20)
     run(["systemctl", "reload", "nginx"], timeout=20)
@@ -1027,57 +1208,74 @@ def issue_certificate(form):
         if ensure_cert_volume(config):
             write_compose(config, "certificate-volume")
             run(["docker", "compose", "up", "-d"], cwd=COMPOSE_DIR, timeout=300)
-            volume_note = " Certificate volume added to Compose."
+            volume_note = " Volume сертификатов добавлен в Compose."
     elif form.get("cert_volume") == ["1"]:
-        volume_note = " Compose is not installed yet; keep the certificate-volume option enabled when applying it."
+        volume_note = " Compose ещё не сохранён — оставьте флажок volume сертификатов включённым при его сохранении."
     containers = run(["docker", "ps", "-a", "--format", "{{.Names}}"], check=False).splitlines()
     if form.get("restart_node") == ["1"] and "remnanode" in containers:
         run(["docker", "restart", "remnanode"], timeout=120)
     dns_note = (
-        f" DNS matched selected server IP {selected_ip}."
+        f" DNS совпадает с выбранным IP {selected_ip}."
         if selected_ip in addresses else
-        f" DNS mismatch was explicitly ignored for selected server IP {selected_ip}."
+        f" Несовпадение DNS с IP {selected_ip} проигнорировано по вашему выбору."
     )
-    https_note = (
-        " Public HTTPS site enabled on TCP 443."
-        if public_https else
-        " TCP 443 is occupied by another service; the site remains available on HTTP and the internal TLS fallback."
-    )
-    return f"Certificate issued: {SSL_DIR}/{domain}.pem and {domain}.key.{dns_note}{https_note}{volume_note}"
+    if public_https:
+        https_note = " Сайт и панель доступны по HTTPS на TCP 443."
+    elif requested_public:
+        https_note = " TCP 443 занят другим процессом, поэтому публичный HTTPS не включён; TLS-заглушка Reality работает на 127.0.0.1:8443."
+    else:
+        https_note = " TLS-заглушка Reality работает на 127.0.0.1:8443, публичный 443 свободен для Xray."
+    return f"Сертификат выпущен: {SSL_DIR}/{domain}.pem и {domain}.key.{dns_note}{https_note}{volume_note}"
+
+
+def parse_x25519(output):
+    """Parse `xray x25519` output.
+
+    Older Xray prints "Private key / Public key"; newer releases print
+    "PrivateKey / Password / Hash32", where Password is the public key.
+    """
+    private = public = ""
+    for line in output.splitlines():
+        label, separator, value = line.partition(":")
+        if not separator:
+            continue
+        label = re.sub(r"[^a-z0-9]", "", label.lower())
+        value = value.strip()
+        if label == "privatekey":
+            private = value
+        elif label in ("publickey", "password"):
+            public = value
+    key_re = re.compile(r"[A-Za-z0-9_-]{42,44}={0,1}")
+    if not (key_re.fullmatch(private or "") and key_re.fullmatch(public or "")):
+        raise RuntimeError("Не удалось разобрать ключи X25519 из вывода Xray: " + output[-1000:])
+    return private, public
 
 
 def reality_keys():
     output = run(["docker", "exec", "remnanode", "/usr/local/bin/xray", "x25519"], timeout=30)
-    private = public = ""
-    for line in output.splitlines():
-        key = line.split(":", 1)[-1].strip()
-        low = line.lower().replace(" ", "")
-        if "privatekey:" in low or "privatekey" in low and ":" in line:
-            private = key
-        if "publickey:" in low or "publickey" in low and ":" in line:
-            public = key
-        if low.startswith("privatekey:"):
-            private = key
-        if low.startswith("publickey:"):
-            public = key
-    if not private or not public:
-        tokens = re.findall(r"[A-Za-z0-9_-]{40,48}", output)
-        if len(tokens) >= 2:
-            private, public = tokens[0], tokens[1]
-    if not private or not public:
-        raise RuntimeError("Could not parse X25519 keys: " + output[-1000:])
-    return private, public
+    return parse_x25519(output)
 
 
 def generate_inbound(form):
     kind = form.get("kind", ["reality"])[0]
     tag = form.get("tag", ["VLESS_REALITY"])[0].strip()
     domain = form.get("inbound_domain", [""])[0].strip().lower()
-    port = int(form.get("inbound_port", ["2053"])[0])
+    try:
+        port = int(form.get("inbound_port", ["2053"])[0])
+    except ValueError as exc:
+        raise ValueError("Порт должен быть числом.") from exc
     if not TAG_RE.fullmatch(tag) or not DOMAIN_RE.fullmatch(domain) or not 1 <= port <= 65535:
-        raise ValueError("Check tag, domain and port.")
+        raise ValueError("Проверьте tag, домен и порт.")
     meta = {}
     if kind == "reality":
+        reserved = {80: "nginx (HTTP и ACME)", 8443: "TLS-заглушка Reality nginx", PORT: "панель Node Forge"}
+        reserved.update({ssh_port: "SSH" for ssh_port in current_ssh_ports()})
+        if port in reserved:
+            raise ValueError(f"TCP {port} занят: {reserved[port]}. Выберите другой порт.")
+        if port == 443 and "nginx" in port_owners(443):
+            raise ValueError("TCP 443 сейчас занят nginx (публичный HTTPS-сайт). Отключите публичный 443 в разделе «Сертификаты» или выберите другой порт.")
+        if not (SSL_DIR / f"{domain}.pem").exists() or not (Path("/etc/nginx/sites-available") / f"rnm-{domain}.conf").exists():
+            raise ValueError(f"Для self-steal нужен TLS-сайт {domain} на 127.0.0.1:8443. Сначала выпустите сертификат для этого домена.")
         private, public = reality_keys()
         short_id = secrets.token_hex(8)
         inbound = {
@@ -1100,7 +1298,7 @@ def generate_inbound(form):
         cert = SSL_DIR / f"{domain}.pem"
         key = SSL_DIR / f"{domain}.key"
         if not cert.exists() or not key.exists():
-            raise ValueError("Issue the certificate before generating Hysteria.")
+            raise ValueError("Сначала выпустите сертификат для этого домена — без него Hysteria не сгенерировать.")
         inbound = {
             "tag": tag, "port": port, "listen": "0.0.0.0", "protocol": "hysteria",
             "settings": {"clients": [], "version": 2},
@@ -1115,14 +1313,14 @@ def generate_inbound(form):
             },
         }
     else:
-        raise ValueError("Unknown inbound type.")
+        raise ValueError("Неизвестный тип inbound.")
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     path = GENERATED_DIR / f"{stamp}-{tag}.json"
     payload = json.dumps(inbound, ensure_ascii=False, indent=2) + "\n"
     atomic_write(path, payload, 0o600)
     atomic_write(STATE_DIR / "last-inbound.json", payload, 0o600)
     atomic_write(STATE_DIR / "last-meta.json", json.dumps(meta), 0o600)
-    return f"Inbound generated: {path}"
+    return f"Inbound сгенерирован: {path}"
 
 
 def apply_network(form):
@@ -1153,7 +1351,7 @@ def apply_network(form):
     atomic_write(SYSCTL_TUNE, body, 0o644)
     run(["sysctl", "-p", str(SYSCTL_TUNE)], timeout=60)
     enabled = [name for name, on in (("BBR", bbr), ("Fast Open", fastopen), ("MTU probing", mtu), ("buffers", buffers), ("backlog", backlog)) if on]
-    return f"Network settings applied: {', '.join(enabled) or 'baseline restored'}. Backup: {saved}"
+    return f"Сетевые настройки применены: {', '.join(enabled) or 'возвращены исходные значения'}. Резервная копия: {saved}"
 
 
 def ssh_socket_ports():
@@ -1234,27 +1432,27 @@ def apply_ssh_access(form):
     try:
         desired_port = int(form.get("ssh_port", [""])[0])
     except ValueError as exc:
-        raise ValueError("Enter a valid SSH port.") from exc
+        raise ValueError("Введите корректный SSH-порт.") from exc
     if not 1 <= desired_port <= 65535:
-        raise ValueError("SSH port must be between 1 and 65535.")
+        raise ValueError("SSH-порт должен быть в диапазоне 1–65535.")
     if desired_port in {PORT, 80, 443}:
-        raise ValueError(f"Port {desired_port} is reserved by the manager or web services.")
+        raise ValueError(f"Порт {desired_port} занят панелью или веб-сервисами.")
     password_auth = form.get("password_auth") == ["1"]
     public_key = form.get("public_key", [""])[0]
     active_ports = current_ssh_ports()
     if port_in_use_by_other_service(desired_port, active_ports):
-        raise ValueError(f"Port {desired_port} is already occupied by another service.")
+        raise ValueError(f"Порт {desired_port} уже занят другим сервисом.")
     saved = backup_ssh_configuration("ssh-stage")
     try:
         key_added = install_root_public_key(public_key)
         if not password_auth and not authorized_key_fingerprints():
-            raise ValueError("Password login cannot be disabled until at least one valid root public key is installed.")
+            raise ValueError("Нельзя выключить вход по паролю, пока у root нет ни одного корректного публичного ключа.")
         staged_ports = sorted(set(active_ports + [desired_port]))
         write_ssh_managed_config(staged_ports, password_auth)
         reload_ssh_stack()
         verify_ssh_auth_settings(password_auth)
         if not local_port_ready(desired_port):
-            raise RuntimeError(f"SSH did not start listening on port {desired_port}.")
+            raise RuntimeError(f"SSH не начал слушать порт {desired_port}.")
         state = {
             "phase": "staged",
             "desired_port": desired_port,
@@ -1268,24 +1466,24 @@ def apply_ssh_access(form):
         restore_ssh_configuration(saved)
         reload_ssh_stack()
         raise
-    key_note = " Public key added." if key_added else " Public key was already installed or left unchanged."
-    password_note = "enabled" if password_auth else "disabled"
-    return f"SSH staged on ports {', '.join(map(str, staged_ports))}; password login is {password_note}.{key_note} Test port {desired_port}, then finalize it below. Backup: {saved}"
+    key_note = " Публичный ключ добавлен." if key_added else " Публичный ключ уже был установлен или не указан."
+    password_note = "включён" if password_auth else "выключен"
+    return f"SSH подготовлен на портах {', '.join(map(str, staged_ports))}; вход по паролю {password_note}.{key_note} Проверьте вход на порт {desired_port}, затем подтвердите его ниже. Резервная копия: {saved}"
 
 
 def finalize_ssh_access(form):
     state = load_ssh_state()
     if state.get("phase") != "staged":
-        raise ValueError("There is no staged SSH port to finalize.")
+        raise ValueError("Нет подготовленного SSH-порта для подтверждения.")
     desired_port = int(state["desired_port"])
     confirm = form.get("confirm_port", [""])[0].strip()
     if confirm != str(desired_port):
-        raise ValueError(f"Type {desired_port} to confirm that the new SSH port was tested.")
+        raise ValueError(f"Введите {desired_port}, чтобы подтвердить, что новый порт проверен.")
     password_auth = bool(state.get("password_auth"))
     if not password_auth and not authorized_key_fingerprints():
-        raise ValueError("No valid root public key was found; refusing to disable the old port.")
+        raise ValueError("У root нет корректного публичного ключа — старый порт не отключён.")
     if not local_port_ready(desired_port):
-        raise RuntimeError(f"Port {desired_port} is not accepting connections; the old port was kept.")
+        raise RuntimeError(f"Порт {desired_port} не принимает подключения — старый порт оставлен.")
     saved = backup_ssh_configuration("ssh-finalize")
     try:
         changed = disable_other_port_directives()
@@ -1293,7 +1491,7 @@ def finalize_ssh_access(form):
         reload_ssh_stack()
         verify_ssh_auth_settings(password_auth)
         if not local_port_ready(desired_port):
-            raise RuntimeError(f"SSH stopped listening on port {desired_port} after finalization.")
+            raise RuntimeError(f"После подтверждения SSH перестал слушать порт {desired_port}.")
         state.update({
             "phase": "finalized", "active_ports": [desired_port],
             "finalize_backup": str(saved), "updated": int(time.time()),
@@ -1303,112 +1501,1043 @@ def finalize_ssh_access(form):
         restore_ssh_configuration(saved)
         reload_ssh_stack()
         raise
-    files_note = f" Disabled old Port directives in {len(changed)} file(s)." if changed else ""
-    return f"SSH finalized on port {desired_port}.{files_note} Password login is {'enabled' if password_auth else 'disabled'}."
+    files_note = f" Старые директивы Port отключены в файлах: {len(changed)}." if changed else ""
+    return f"SSH работает только на порту {desired_port}.{files_note} Вход по паролю {'включён' if password_auth else 'выключен'}."
 
 
 def rollback_ssh_access():
     state = load_ssh_state()
     backup_path = state.get("backup")
     if not backup_path:
-        raise ValueError("No SSH backup is recorded for rollback.")
+        raise ValueError("Нет сохранённой резервной копии SSH для отката.")
     restore_ssh_configuration(backup_path)
     reload_ssh_stack()
     state.update({"phase": "rolled_back", "updated": int(time.time())})
     save_ssh_state(state)
-    return f"SSH configuration restored from {backup_path}."
+    return f"Настройки SSH восстановлены из {backup_path}."
 
 
 def node_action(form):
     action = form.get("action", [""])[0]
     if action == "restart":
         run(["docker", "restart", "remnanode"], timeout=120)
-        return "RemnaNode restarted."
+        return "RemnaNode перезапущена."
     if action == "start":
         run(["docker", "compose", "up", "-d"], cwd=COMPOSE_DIR, timeout=300)
-        return "RemnaNode started."
+        return "RemnaNode запущена."
     if action == "pull":
         run(["docker", "compose", "pull"], cwd=COMPOSE_DIR, timeout=900)
         run(["docker", "compose", "up", "-d"], cwd=COMPOSE_DIR, timeout=300)
-        return "Image updated and container recreated."
-    raise ValueError("Unknown action.")
+        return "Образ обновлён, контейнер пересоздан."
+    raise ValueError("Неизвестное действие.")
 
+
+LIGHT_VARS = "--bg:#f3f5f9;--bg-soft:#eceff5;--card:rgba(255,255,255,.82);--card-solid:#ffffff;--elev:#f1f4f9;--border:rgba(15,23,42,.08);--border-strong:rgba(15,23,42,.16);--text:#0f172a;--muted:#55657b;--faint:#8592a6;--accent:#0d9488;--accent-2:#6366f1;--accent-ink:#ffffff;--accent-soft:rgba(13,148,136,.10);--ok:#059669;--warn:#b45309;--danger:#dc2626;--danger-soft:rgba(220,38,38,.07);--warn-soft:rgba(217,119,6,.08);--input:#ffffff;--term:#0b1220;--shadow:0 1px 2px rgba(15,23,42,.04),0 18px 40px -24px rgba(15,23,42,.22);--glow-1:rgba(13,148,136,.10);--glow-2:rgba(99,102,241,.09);color-scheme:light"
 
 CSS = r'''
-:root{--ink:#07111d;--panel:#0d1d2b;--panel2:#112638;--line:#274359;--text:#dceaf5;--muted:#88a4b8;--cyan:#55d6cf;--amber:#ffb65c;--red:#ff6d78;--mono:ui-monospace,SFMono-Regular,Consolas,monospace;--sans:"Segoe UI Variable",Tahoma,sans-serif}*{box-sizing:border-box}body{margin:0;background:var(--ink);color:var(--text);font:15px/1.5 var(--sans);min-height:100vh}body:before{content:"";position:fixed;inset:0;background:linear-gradient(90deg,transparent 49.8%,rgba(85,214,207,.035) 50%,transparent 50.2%),linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px);background-size:180px 100%,100% 36px;pointer-events:none}.shell{max-width:1220px;margin:auto;padding:28px 24px 80px}.mast{display:grid;grid-template-columns:1fr auto;gap:20px;align-items:end;border-bottom:1px solid var(--line);padding-bottom:22px;margin-bottom:24px}.eyebrow,.label{font:700 11px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--cyan)}h1{font-size:clamp(34px,7vw,70px);line-height:.92;letter-spacing:-.055em;margin:10px 0 0;max-width:760px}.rail{display:flex;gap:8px;align-items:center;font-family:var(--mono);font-size:12px;color:var(--muted)}.pulse{width:10px;height:10px;border-radius:50%;background:var(--cyan);box-shadow:0 0 0 6px rgba(85,214,207,.08)}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}.card{grid-column:span 4;background:rgba(13,29,43,.93);border:1px solid var(--line);padding:20px;min-width:0}.card.wide{grid-column:span 8}.card.full{grid-column:1/-1}.card h2{font-size:19px;margin:8px 0 16px;letter-spacing:-.02em}.metric{display:flex;justify-content:space-between;gap:16px;padding:9px 0;border-top:1px solid rgba(39,67,89,.65)}.metric b,.mono,code,pre{font-family:var(--mono)}.ok{color:var(--cyan)}.warn{color:var(--amber)}.error{color:var(--red)}label{display:block;margin:12px 0 6px;color:var(--muted);font-size:13px}input,select,textarea{width:100%;background:#07131f;color:var(--text);border:1px solid #31516a;padding:11px 12px;border-radius:2px;font:14px var(--mono);outline:none}input:focus,select:focus,textarea:focus{border-color:var(--cyan);box-shadow:0 0 0 3px rgba(85,214,207,.09)}textarea{min-height:220px;resize:vertical}.ssh-key{min-height:105px}.ssh-password{margin-top:36px}.ssh-confirm{margin-top:18px;padding:15px;border:1px solid rgba(255,182,92,.55);background:#231b12}.row{display:flex;gap:10px;flex-wrap:wrap}.row>*{flex:1 1 180px}.check{display:flex;gap:9px;align-items:center;color:var(--text)}.check input{width:auto}button,.button{background:var(--cyan);color:#061218;border:0;padding:11px 15px;font-weight:750;cursor:pointer;text-decoration:none;display:inline-block}.secondary{background:#173149;color:var(--text);border:1px solid #31516a}.danger{background:var(--red)}button:hover{filter:brightness(1.08)}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}.flash{border-left:4px solid var(--cyan);background:#102a31;padding:12px 15px;margin-bottom:14px}.flash.error{border-color:var(--red);background:#2b1720}.certs{display:flex;gap:7px;flex-wrap:wrap}.pill{font:12px var(--mono);border:1px solid var(--line);padding:5px 8px;color:var(--muted)}pre{white-space:pre-wrap;word-break:break-word;background:#050c13;border:1px solid #20394e;padding:14px;max-height:360px;overflow:auto;color:#b9d3e5}.copybox{position:relative}.copybox button{position:absolute;right:8px;top:8px;padding:6px 9px}.muted{color:var(--muted)}footer{margin-top:26px;color:var(--muted);font:12px var(--mono)}@media(max-width:850px){.card,.card.wide{grid-column:1/-1}.mast{grid-template-columns:1fr}.rail{justify-content:flex-start}}@media(prefers-reduced-motion:no-preference){.pulse{animation:pulse 2.2s infinite}@keyframes pulse{50%{box-shadow:0 0 0 12px rgba(85,214,207,0)}}}
-.pipeline{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin:16px 0}.stage{background:#091621;padding:12px;min-height:76px}.stage small{display:block;color:var(--muted);font:10px var(--mono);text-transform:uppercase;letter-spacing:.1em}.stage b{display:block;margin-top:7px;font:13px var(--mono)}.terminal{min-height:330px;max-height:520px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#03090e;color:#b9d3e5;border:1px solid #20394e;padding:14px;font:12px/1.55 var(--mono)}.logbar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:10px 0}.tabs{display:flex;gap:7px;flex-wrap:wrap}.tabs button.active{background:var(--amber);color:#1d1307}.stream-state{font:11px var(--mono);color:var(--muted)}.stream-state.live{color:var(--cyan)}.spinner{display:inline-block;width:9px;height:9px;border:2px solid rgba(85,214,207,.25);border-top-color:var(--cyan);border-radius:50%;margin-right:7px;vertical-align:-1px;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:850px){.pipeline{grid-template-columns:1fr 1fr}}@media(prefers-reduced-motion:reduce){.spinner{animation:none}}
+:root{--bg:#070b12;--bg-soft:#0b111b;--card:rgba(16,23,35,.74);--card-solid:#111926;--elev:#151e2d;--border:rgba(148,163,184,.12);--border-strong:rgba(148,163,184,.22);--text:#e8edf5;--muted:#8d9bb0;--faint:#5f6d82;--accent:#5eead4;--accent-2:#818cf8;--accent-ink:#03221d;--accent-soft:rgba(94,234,212,.11);--ok:#34d399;--warn:#fbbf24;--danger:#f87171;--danger-soft:rgba(248,113,113,.10);--warn-soft:rgba(251,191,36,.09);--input:#0a101a;--term:#05080e;--shadow:0 1px 0 rgba(255,255,255,.03) inset,0 24px 50px -28px rgba(0,0,0,.7);--glow-1:rgba(94,234,212,.09);--glow-2:rgba(129,140,248,.10);--radius:16px;--radius-sm:11px;--sans:"Inter",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--ease:cubic-bezier(.2,.8,.2,1);color-scheme:dark}
+''' + ":root[data-theme=light]{" + LIGHT_VARS + "}@media (prefers-color-scheme:light){:root:not([data-theme]){" + LIGHT_VARS + "}}" + r'''
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font:14.5px/1.55 var(--sans);font-feature-settings:"cv11","ss01","ss03";-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+::selection{background:var(--accent-soft);color:var(--text)}
+.aurora{position:fixed;inset:-25vmax;z-index:0;pointer-events:none;background:radial-gradient(38vmax 28vmax at 18% 12%,var(--glow-1),transparent 62%),radial-gradient(34vmax 30vmax at 88% 18%,var(--glow-2),transparent 62%),radial-gradient(40vmax 30vmax at 55% 105%,var(--glow-1),transparent 60%)}
+.grain{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.5;background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:56px 56px;mask-image:radial-gradient(ellipse at 50% 0%,#000 0,transparent 70%);-webkit-mask-image:radial-gradient(ellipse at 50% 0%,#000 0,transparent 70%)}
+a{color:var(--accent);text-underline-offset:3px}
+code{font:12.5px var(--mono);padding:2px 6px;border-radius:6px;background:var(--elev);border:1px solid var(--border)}
+.ic{width:18px;height:18px;flex:none;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.app{position:relative;z-index:1;display:grid;grid-template-columns:252px minmax(0,1fr);min-height:100vh}
+.side{position:sticky;top:0;height:100vh;display:flex;flex-direction:column;gap:20px;padding:22px 14px;border-right:1px solid var(--border);background:color-mix(in srgb,var(--bg) 72%,transparent);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px)}
+.brand{display:flex;align-items:center;gap:12px;padding:2px 10px 6px;color:var(--text);text-decoration:none}
+.brand svg{width:36px;height:36px;flex:none;border-radius:11px;box-shadow:0 10px 26px -10px var(--accent)}
+.brand b{display:block;font-size:15.5px;font-weight:700;letter-spacing:-.015em}
+.brand small{display:block;color:var(--muted);font-size:12px;font-weight:500}
+.nav{display:flex;flex-direction:column;gap:2px}
+.nav-label{padding:0 12px 6px;color:var(--faint);font:600 10.5px var(--mono);letter-spacing:.14em;text-transform:uppercase}
+.nav a{position:relative;display:flex;align-items:center;gap:11px;padding:9px 12px;border-radius:10px;color:var(--muted);text-decoration:none;font-weight:500;transition:color .2s,background .2s}
+.nav a:hover{color:var(--text);background:var(--elev)}
+.nav a.active{color:var(--text);background:var(--accent-soft)}
+.nav a.active:before{content:"";position:absolute;left:-14px;top:9px;bottom:9px;width:3px;border-radius:0 3px 3px 0;background:linear-gradient(var(--accent),var(--accent-2))}
+.nav a.active .ic{color:var(--accent)}
+.nav .badge{margin-left:auto;width:7px;height:7px;border-radius:50%;background:var(--warn);box-shadow:0 0 0 3px var(--warn-soft)}
+.nav .badge.ok{background:var(--ok);box-shadow:0 0 0 3px var(--accent-soft)}
+.side-foot{margin-top:auto;display:grid;gap:10px;padding:12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--card)}
+.side-foot .ip{display:flex;align-items:center;gap:9px;color:var(--muted);font:500 12.5px var(--mono);overflow-wrap:anywhere}
+.tool-row{display:flex;gap:8px}
+.icon-btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;flex:1;height:34px;padding:0 10px;border:1px solid var(--border);border-radius:9px;background:transparent;color:var(--muted);font:500 12.5px var(--sans);text-decoration:none;cursor:pointer;transition:color .2s,border-color .2s,background .2s}
+.icon-btn:hover{color:var(--text);border-color:var(--border-strong);background:var(--elev)}
+.icon-btn .ic{width:16px;height:16px}
+.content{min-width:0;padding:28px clamp(16px,3.6vw,48px) 72px;max-width:1320px}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:26px}
+.crumb{color:var(--muted);font-size:12.5px;font-weight:500}
+.topbar h1{margin:2px 0 0;font-size:clamp(25px,3vw,32px);font-weight:700;letter-spacing:-.03em;line-height:1.15}
+.top-tools{display:flex;align-items:center;gap:10px}
+.mobile-only{display:none}
+.chip{display:inline-flex;align-items:center;gap:9px;height:34px;padding:0 13px;border:1px solid var(--border);border-radius:999px;background:var(--card);color:var(--muted);font:500 12.5px var(--mono);white-space:nowrap;backdrop-filter:blur(10px)}
+.dot{position:relative;display:inline-block;width:8px;height:8px;flex:none;border-radius:50%;background:var(--faint)}
+.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--danger)}
+.dot.ok:after,.dot.warn:after{content:"";position:absolute;inset:0;border-radius:50%;background:inherit}
+.view{display:none}
+.view.active{display:block}
+.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:16px;margin-bottom:16px}
+.span-3{grid-column:span 3}.span-4{grid-column:span 4}.span-5{grid-column:span 5}.span-6{grid-column:span 6}.span-7{grid-column:span 7}.span-8{grid-column:span 8}.span-12{grid-column:1/-1}
+.card{position:relative;min-width:0;margin-bottom:16px;padding:22px;border:1px solid var(--border);border-radius:var(--radius);background:var(--card);box-shadow:var(--shadow);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px)}
+.grid>.card{margin-bottom:0}
+.card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:18px}
+.card h2{margin:0;font-size:16.5px;font-weight:650;letter-spacing:-.015em}
+.card h3{margin:18px 0 10px;font-size:14px;font-weight:600}
+.sub{margin:5px 0 0;color:var(--muted);font-size:13.5px;max-width:70ch}
+.eyebrow{display:flex;align-items:center;gap:7px;margin-bottom:9px;color:var(--accent);font:600 10.5px var(--mono);letter-spacing:.14em;text-transform:uppercase}
+.stat{display:flex;flex-direction:column;gap:7px;padding:18px 18px 16px;overflow:hidden}
+.stat:after{content:"";position:absolute;right:-30px;top:-30px;width:90px;height:90px;border-radius:50%;background:radial-gradient(circle,var(--accent-soft),transparent 70%);pointer-events:none}
+.stat .k{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12.5px;font-weight:500}
+.stat .k .ic{width:16px;height:16px}
+.stat .v{display:flex;align-items:center;gap:9px;font:650 19px/1.25 var(--sans);letter-spacing:-.02em;overflow-wrap:anywhere}
+.stat .v.mono{font:500 14.5px/1.4 var(--mono);letter-spacing:0}
+.stat .h{color:var(--faint);font-size:12px}
+.ok-t{color:var(--ok)}.warn-t{color:var(--warn)}.bad-t{color:var(--danger)}.muted{color:var(--muted)}.faint{color:var(--faint)}.mono{font-family:var(--mono)}
+.steps{display:grid;gap:8px;margin:0;padding:0;list-style:none}
+.steps a{display:flex;align-items:center;gap:13px;padding:12px 14px;border:1px solid var(--border);border-radius:12px;color:var(--text);text-decoration:none;transition:border-color .2s,background .2s,transform .25s var(--ease)}
+.steps a:hover{border-color:var(--border-strong);background:var(--elev);transform:translateX(3px)}
+.steps .n{display:grid;place-items:center;width:28px;height:28px;flex:none;border:1px solid var(--border-strong);border-radius:50%;color:var(--muted);font:600 12px var(--mono)}
+.steps .n .ic{width:15px;height:15px;stroke-width:2.6}
+.steps .done .n{border-color:transparent;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:var(--accent-ink)}
+.steps b{display:block;font-weight:600;font-size:13.5px}
+.steps small{display:block;color:var(--muted);font-size:12.5px}
+.steps .go{margin-left:auto;color:var(--faint)}
+.kv{display:grid}
+.kv>div{display:flex;justify-content:space-between;gap:16px;padding:10px 0;border-top:1px solid var(--border)}
+.kv>div:first-child{border-top:0;padding-top:0}
+.kv span{color:var(--muted)}
+.kv b{font:500 13px var(--mono);text-align:right;overflow-wrap:anywhere}
+.field{display:block;margin:0 0 15px}
+.field>span{display:block;margin-bottom:7px;color:var(--muted);font-size:13px;font-weight:500}
+.hint{margin:7px 0 0;color:var(--faint);font-size:12.5px;line-height:1.5}
+input,select,textarea{width:100%;padding:11px 13px;border:1px solid var(--border-strong);border-radius:10px;background:var(--input);color:var(--text);font:14px var(--sans);outline:none;transition:border-color .2s,box-shadow .2s,background .2s}
+input::placeholder,textarea::placeholder{color:var(--faint)}
+textarea,.mono-in{font:13px/1.6 var(--mono)}
+textarea{min-height:260px;resize:vertical}
+textarea.short{min-height:96px}
+input:hover,select:hover,textarea:hover{border-color:color-mix(in srgb,var(--accent) 35%,var(--border-strong))}
+input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 4px var(--accent-soft)}
+select{appearance:none;-webkit-appearance:none;padding-right:38px;background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);background-position:calc(100% - 19px) 52%,calc(100% - 14px) 52%;background-size:5px 5px;background-repeat:no-repeat}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:0 14px}
+.check{display:flex;align-items:flex-start;gap:11px;margin:0 0 12px;color:var(--text);font-size:13.5px;cursor:pointer}
+.check input{appearance:none;-webkit-appearance:none;display:grid;place-items:center;flex:none;width:18px;height:18px;margin:1px 0 0;padding:0;border:1.5px solid var(--border-strong);border-radius:6px;background:var(--input);cursor:pointer;transition:background .2s,border-color .2s}
+.check input:checked{border-color:var(--accent);background:var(--accent)}
+.check input:checked:after{content:"";width:9px;height:5px;border:2px solid var(--accent-ink);border-top:0;border-right:0;transform:translateY(-1px) rotate(-45deg)}
+.check small{display:block;margin-top:1px;color:var(--muted);font-size:12.5px}
+.switch-row{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:14px 0;border-top:1px solid var(--border);cursor:pointer}
+.switch-row:first-child{border-top:0;padding-top:2px}
+.switch-row b{display:block;font-weight:600}
+.switch-row small{display:block;margin-top:2px;color:var(--muted);font-size:12.5px}
+.switch-row code{font-size:11.5px}
+.switch{appearance:none;-webkit-appearance:none;position:relative;flex:none;width:44px;height:25px;margin:0;padding:0;border:1px solid var(--border-strong);border-radius:999px;background:var(--elev);cursor:pointer;transition:background .3s var(--ease),border-color .3s}
+.switch:after{content:"";position:absolute;top:2px;left:2px;width:19px;height:19px;border-radius:50%;background:var(--muted);box-shadow:0 2px 6px rgba(0,0,0,.3);transition:transform .35s var(--ease),background .3s}
+.switch:checked{border-color:var(--accent);background:var(--accent)}
+.switch:checked:after{transform:translateX(19px);background:var(--accent-ink)}
+.switch:focus-visible{box-shadow:0 0 0 4px var(--accent-soft)}
+.actions{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:18px}
+.actions.tight{margin-top:0}
+.btn{position:relative;display:inline-flex;align-items:center;justify-content:center;gap:8px;height:40px;padding:0 17px;border:1px solid transparent;border-radius:10px;background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 62%,var(--accent-2)));color:var(--accent-ink);font:600 13.5px var(--sans);text-decoration:none;white-space:nowrap;cursor:pointer;box-shadow:0 10px 24px -14px var(--accent);transition:transform .15s var(--ease),box-shadow .25s,filter .2s,opacity .2s,background .2s}
+.btn .ic{width:16px;height:16px}
+.btn:hover{filter:brightness(1.07);box-shadow:0 14px 28px -14px var(--accent)}
+.btn:active{transform:translateY(1px) scale(.985)}
+.btn:focus-visible{outline:none;box-shadow:0 0 0 4px var(--accent-soft)}
+.btn.ghost{border-color:var(--border-strong);background:transparent;color:var(--text);box-shadow:none}
+.btn.ghost:hover{background:var(--elev)}
+.btn.danger{background:var(--danger);color:#fff;box-shadow:0 10px 24px -14px var(--danger)}
+.btn.small{height:32px;padding:0 12px;font-size:12.5px;border-radius:9px}
+.btn[disabled]{opacity:.55;cursor:progress}
+.btn.loading{color:transparent!important}
+.btn.loading .ic{opacity:0}
+.btn.loading:after{content:"";position:absolute;width:16px;height:16px;border:2px solid var(--accent-ink);border-right-color:transparent;border-radius:50%;animation:spin .7s linear infinite}
+.btn.ghost.loading:after{border-color:var(--text);border-right-color:transparent}
+.btn.danger.loading:after{border-color:#fff;border-right-color:transparent}
+.notice{display:flex;gap:12px;margin:16px 0 0;padding:13px 15px;border:1px solid var(--border);border-radius:12px;background:var(--elev);color:var(--muted);font-size:13px;line-height:1.55}
+.notice .ic{margin-top:1px;color:var(--accent)}
+.notice b{color:var(--text)}
+.notice.warn{border-color:color-mix(in srgb,var(--warn) 38%,transparent);background:var(--warn-soft);color:var(--text)}
+.notice.warn .ic{color:var(--warn)}
+.notice.danger{border-color:color-mix(in srgb,var(--danger) 38%,transparent);background:var(--danger-soft);color:var(--text)}
+.notice.danger .ic{color:var(--danger)}
+.pills{display:flex;flex-wrap:wrap;gap:8px}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:5px 10px;border:1px solid var(--border);border-radius:999px;background:var(--elev);color:var(--muted);font:500 12px var(--mono)}
+.pill.ok{border-color:color-mix(in srgb,var(--ok) 40%,transparent);color:var(--ok)}
+.pill.warn{border-color:color-mix(in srgb,var(--warn) 40%,transparent);color:var(--warn)}
+.pill.bad{border-color:color-mix(in srgb,var(--danger) 40%,transparent);color:var(--danger)}
+.pipeline{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:20px 0 14px}
+.stage{position:relative;overflow:hidden;padding:13px 14px;border:1px solid var(--border);border-radius:12px;background:var(--elev);transition:border-color .35s,background .35s}
+.stage small{display:flex;align-items:center;gap:7px;color:var(--faint);font:600 10.5px var(--mono);letter-spacing:.1em;text-transform:uppercase}
+.stage small i{display:grid;place-items:center;width:16px;height:16px;border:1.5px solid currentColor;border-radius:50%;font-style:normal}
+.stage b{display:block;margin-top:7px;font:500 13px var(--mono);overflow-wrap:anywhere}
+.stage.done{border-color:color-mix(in srgb,var(--ok) 40%,transparent)}
+.stage.done small{color:var(--ok)}
+.stage.done small i{border-color:var(--ok);background:var(--ok)}
+.stage.done small i:after{content:"";width:6px;height:3px;margin-top:-1px;border:1.6px solid var(--bg);border-top:0;border-right:0;transform:rotate(-45deg)}
+.stage.active{border-color:color-mix(in srgb,var(--accent) 55%,transparent);background:color-mix(in srgb,var(--accent) 6%,var(--elev))}
+.stage.active small{color:var(--accent)}
+.stage.active small i{border-color:var(--accent);border-right-color:transparent;animation:spin .9s linear infinite}
+.stage.active:after{content:"";position:absolute;left:0;right:0;bottom:0;height:2px;background:linear-gradient(90deg,transparent,var(--accent),transparent);animation:sweep 1.5s linear infinite}
+.stage.failed{border-color:color-mix(in srgb,var(--danger) 50%,transparent);background:var(--danger-soft)}
+.stage.failed small{color:var(--danger)}
+.progress{height:6px;overflow:hidden;border:1px solid var(--border);border-radius:999px;background:var(--elev)}
+.progress i{display:block;width:0;height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--accent),var(--accent-2),var(--accent));background-size:200% 100%;transition:width .9s var(--ease)}
+.progress.running i{animation:flow 1.8s linear infinite}
+.progress.failed i{background:var(--danger)}
+.job-msg{display:flex;align-items:center;gap:10px;min-height:22px;margin:14px 0 12px;color:var(--muted);font:500 12.5px var(--mono)}
+.spinner{width:13px;height:13px;flex:none;border:2px solid var(--accent-soft);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+.term{margin:0;min-height:120px;max-height:440px;overflow:auto;padding:14px 16px;border:1px solid var(--border);border-radius:12px;background:var(--term);color:#c3d0e2;font:12.5px/1.65 var(--mono);white-space:pre-wrap;word-break:break-word;scrollbar-color:#263247 transparent}
+.term.tall{min-height:440px;max-height:64vh}
+.term .l{display:block;white-space:pre-wrap}
+.term .l.e{color:#fca5a5}
+.term .l.w{color:#fcd34d}
+.term .l.s{color:#6b7a90}
+.term::-webkit-scrollbar{width:10px;height:10px}
+.term::-webkit-scrollbar-thumb{border:3px solid var(--term);border-radius:10px;background:#263247}
+.code-wrap{position:relative}
+.code-wrap .btn{position:absolute;top:10px;right:10px;z-index:1}
+.code-wrap .term{padding-right:120px}
+.segmented{display:inline-flex;gap:3px;padding:3px;border:1px solid var(--border);border-radius:11px;background:var(--elev)}
+.segmented button{height:30px;padding:0 13px;border:0;border-radius:8px;background:transparent;color:var(--muted);font:500 12.5px var(--sans);cursor:pointer;transition:background .25s,color .25s,box-shadow .25s}
+.segmented button:hover{color:var(--text)}
+.segmented button.active{background:var(--card-solid);color:var(--text);box-shadow:0 2px 10px -3px rgba(0,0,0,.4)}
+.live{display:inline-flex;align-items:center;gap:8px;color:var(--muted);font:500 12px var(--mono)}
+.toolbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
+.sites{display:grid;gap:10px}
+.site{display:grid;gap:10px;padding:14px;border:1px solid var(--border);border-radius:12px;background:var(--elev);transition:border-color .2s}
+.site:hover{border-color:var(--border-strong)}
+.site-row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 12px;min-width:0}
+.site-row>b{font-size:13.5px;overflow-wrap:anywhere}
+.site-link{min-width:0;font-size:12px;overflow-wrap:anywhere}
+.pill{white-space:nowrap}
+.pill.fp{width:100%;border-radius:10px;text-align:left;cursor:pointer;white-space:normal;overflow-wrap:anywhere;line-height:1.5}
+.empty{display:grid;place-items:center;gap:6px;padding:28px 16px;border:1px dashed var(--border-strong);border-radius:12px;color:var(--muted);text-align:center;font-size:13px}
+.empty .ic{width:22px;height:22px;color:var(--faint)}
+.foot{margin-top:30px;color:var(--faint);font:12px var(--mono)}
+#toasts{position:fixed;right:20px;bottom:20px;z-index:60;display:grid;gap:10px;width:min(430px,calc(100vw - 32px))}
+.toast{display:flex;align-items:flex-start;gap:12px;padding:13px 14px;border:1px solid var(--border-strong);border-left:3px solid var(--ok);border-radius:12px;background:var(--card-solid);box-shadow:0 24px 50px -20px rgba(0,0,0,.55);font-size:13.5px;animation:toastIn .5s var(--ease) both}
+.toast.error{border-left-color:var(--danger)}
+.toast .ic{margin-top:1px;color:var(--ok)}
+.toast.error .ic{color:var(--danger)}
+.toast p{flex:1;margin:0;overflow-wrap:anywhere}
+.toast button{padding:0 2px;border:0;background:none;color:var(--faint);font-size:19px;line-height:1;cursor:pointer}
+.toast.out{animation:toastOut .32s ease-in forwards}
+dialog{width:min(440px,calc(100vw - 32px));padding:0;border:1px solid var(--border-strong);border-radius:18px;background:var(--card-solid);color:var(--text);box-shadow:0 40px 90px -30px rgba(0,0,0,.7)}
+dialog[open]{animation:pop .32s var(--ease)}
+dialog::backdrop{background:rgba(3,6,12,.58);backdrop-filter:blur(5px);-webkit-backdrop-filter:blur(5px)}
+.dlg{padding:24px}
+.dlg-icon{display:grid;place-items:center;width:42px;height:42px;margin-bottom:14px;border-radius:12px;background:var(--warn-soft);color:var(--warn)}
+.dlg h3{margin:0 0 8px;font-size:17px;letter-spacing:-.01em}
+.dlg p{margin:0;color:var(--muted);line-height:1.6}
+.dlg .actions{justify-content:flex-end;margin-top:24px}
+.login{position:relative;z-index:1;display:grid;place-items:center;min-height:100vh;padding:24px 16px}
+.login-card{width:min(410px,100%);padding:32px;border:1px solid var(--border);border-radius:22px;background:var(--card);box-shadow:var(--shadow);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px)}
+.login-card .brand{padding:0 0 26px}
+.login-card h1{margin:0 0 6px;font-size:25px;letter-spacing:-.025em}
+.login-card .btn{width:100%;height:44px;margin-top:4px}
+.pw{position:relative}
+.pw input{padding-right:48px}
+.pw button{position:absolute;top:50%;right:6px;display:grid;place-items:center;width:34px;height:34px;border:0;border-radius:8px;background:transparent;color:var(--muted);cursor:pointer;transform:translateY(-50%)}
+.pw button:hover{color:var(--text);background:var(--elev)}
+.form-error{display:flex;gap:10px;margin:0 0 16px;padding:11px 13px;border:1px solid color-mix(in srgb,var(--danger) 40%,transparent);border-radius:10px;background:var(--danger-soft);color:var(--text);font-size:13px}
+.form-error .ic{color:var(--danger)}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes sweep{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
+@keyframes flow{to{background-position:-200% 0}}
+@keyframes ping{0%{transform:scale(1);opacity:.65}80%,100%{transform:scale(3.4);opacity:0}}
+@keyframes rise{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+@keyframes toastIn{from{opacity:0;transform:translateY(16px) scale(.96)}}
+@keyframes toastOut{to{opacity:0;transform:translateX(36px)}}
+@keyframes pop{from{opacity:0;transform:translateY(10px) scale(.96)}}
+@keyframes drift{to{transform:translate3d(3vmax,-2.5vmax,0) rotate(5deg)}}
+@keyframes shake{20%,60%{transform:translateX(-6px)}40%,80%{transform:translateX(6px)}}
+@media (prefers-reduced-motion:no-preference){
+.aurora{animation:drift 28s ease-in-out infinite alternate}
+.dot.ok:after,.dot.warn:after{animation:ping 2.2s var(--ease) infinite}
+.view.active>*{animation:rise .55s var(--ease) both}
+.view.active>*:nth-child(2){animation-delay:.06s}
+.view.active>*:nth-child(3){animation-delay:.12s}
+.view.active>*:nth-child(4){animation-delay:.18s}
+.view.active>*:nth-child(n+5){animation-delay:.22s}
+.grid>.card{animation:rise .55s var(--ease) both}
+.grid>.card:nth-child(2){animation-delay:.05s}
+.grid>.card:nth-child(3){animation-delay:.1s}
+.grid>.card:nth-child(4){animation-delay:.15s}
+.no-anim .view.active>*,.no-anim .grid>.card{animation:none}
+.login-card{animation:rise .7s var(--ease) both}
+.login-card.shake{animation:shake .45s var(--ease)}
+.card{transition:border-color .3s,transform .35s var(--ease)}
+.stat:hover{transform:translateY(-2px);border-color:var(--border-strong)}
+}
+@media (max-width:1180px){.span-3{grid-column:span 6}.span-4,.span-5,.span-6,.span-7,.span-8{grid-column:1/-1}}
+@media (max-width:880px){
+.app{grid-template-columns:1fr}
+.side{position:sticky;z-index:20;height:auto;flex-direction:row;align-items:center;gap:6px;padding:10px 12px;border-right:0;border-bottom:1px solid var(--border);overflow-x:auto;scrollbar-width:none}
+.side::-webkit-scrollbar{display:none}
+.side .brand{padding:0 8px 0 0}.side .brand div,.nav-label,.side-foot{display:none}
+.nav{flex-direction:row}.nav a{padding:8px 11px;white-space:nowrap}.nav a.active:before{display:none}
+.content{padding-top:20px}
+.topbar{align-items:flex-start}
+.mobile-only{display:inline-flex}
+.pipeline{grid-template-columns:1fr 1fr}
+}
+@media (max-width:560px){.span-3{grid-column:1/-1}.card{padding:18px}.chip span.long{display:none}.code-wrap .term{padding-right:16px;padding-top:52px}}
+@media (prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
 '''
+
+THEME_JS = r'''try{var t=localStorage.getItem("nf-theme");if(t==="light"||t==="dark")document.documentElement.dataset.theme=t}catch(e){}'''
+
+COMMON_JS = r'''
+(function(){
+"use strict";
+function currentTheme(){var t=document.documentElement.dataset.theme;if(t)return t;return window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches?"light":"dark";}
+document.addEventListener("click",function(e){
+  var themeButton=e.target.closest("[data-theme-toggle]");
+  if(themeButton){var next=currentTheme()==="dark"?"light":"dark";document.documentElement.dataset.theme=next;try{localStorage.setItem("nf-theme",next)}catch(_e){}}
+  var eye=e.target.closest("[data-reveal]");
+  if(eye){var input=document.getElementById(eye.dataset.reveal);if(input){var show=input.type==="password";input.type=show?"text":"password";eye.setAttribute("aria-label",show?"Скрыть пароль":"Показать пароль");eye.classList.toggle("on",show);input.focus();}}
+});
+})();
+'''
+
+APP_JS = r'''
+(function(){
+"use strict";
+var bootNode=document.getElementById("boot");
+var boot={};try{boot=JSON.parse(bootNode?bootNode.textContent:"{}")}catch(_e){}
+var base=boot.base||"";
+var STATE=boot.stateLabels||{};
+var PHASE=boot.phaseLabels||{};
+var ACTIVE=["queued","pulling","starting","verifying"];
+var ORDER={queued:1,pulling:1,starting:2,verifying:3,installed:4};
+var PROGRESS={idle:0,queued:8,pulling:34,starting:64,verifying:86,installed:100};
+var DRAFT="node-forge-compose-draft";
+var ICON_OK='<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
+var ICON_ERR='<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>';
+function $(s,r){return (r||document).querySelector(s);}
+function $$(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s));}
+function esc(v){var n=document.createElement("span");n.textContent=v==null?"":String(v);return n.innerHTML;}
+function byId(id){return document.getElementById(id);}
+function setText(id,v){var el=byId(id);v=v==null?"":String(v);if(el&&el.textContent!==v)el.textContent=v;}
+
+/* ---------- toasts ---------- */
+function toast(message,kind){
+  var box=byId("toasts");if(!box||!message)return;
+  var el=document.createElement("div");
+  el.className="toast"+(kind==="error"?" error":"");
+  el.setAttribute("role",kind==="error"?"alert":"status");
+  el.innerHTML=(kind==="error"?ICON_ERR:ICON_OK)+"<p>"+esc(message)+'</p><button type="button" aria-label="Закрыть">×</button>';
+  var closed=false;
+  function close(){if(closed)return;closed=true;el.classList.add("out");setTimeout(function(){el.remove()},340);}
+  el.querySelector("button").addEventListener("click",close);
+  box.appendChild(el);
+  while(box.children.length>4)box.firstChild.remove();
+  setTimeout(close,kind==="error"?14000:6500);
+}
+
+/* ---------- confirm dialog ---------- */
+function ask(text,danger){
+  var dialog=byId("confirm");
+  if(!dialog||typeof dialog.showModal!=="function")return Promise.resolve(window.confirm(text));
+  setText("confirm-text",text);
+  var ok=byId("confirm-ok");ok.className="btn"+(danger?" danger":"");
+  return new Promise(function(resolve){
+    function onClose(){dialog.removeEventListener("close",onClose);resolve(dialog.returnValue==="ok");}
+    dialog.returnValue="";
+    dialog.addEventListener("close",onClose);
+    dialog.showModal();
+    setTimeout(function(){(danger?byId("confirm-cancel"):ok).focus()},30);
+  });
+}
+
+/* ---------- views ---------- */
+function show(name,scroll){
+  var target=byId("view-"+name)||byId("view-overview");
+  if(!target)return;
+  name=target.id.slice(5);
+  document.body.classList.remove("no-anim");
+  $$(".view").forEach(function(v){v.classList.toggle("active",v===target)});
+  $$(".nav a").forEach(function(a){
+    var on=a.dataset.view===name;a.classList.toggle("active",on);
+    if(on){a.setAttribute("aria-current","page");if(a.scrollIntoView&&window.innerWidth<880)a.scrollIntoView({block:"nearest",inline:"center",behavior:"smooth"});}
+    else a.removeAttribute("aria-current");
+  });
+  setText("view-title",target.dataset.title||"");
+  setText("view-crumb",target.dataset.crumb||"");
+  document.title=(target.dataset.title||"Node Forge")+" · Node Forge";
+  if(scroll)window.scrollTo({top:0,behavior:"smooth"});
+  if(name==="logs")ensureStream();
+}
+window.addEventListener("hashchange",function(){show(location.hash.slice(1),true)});
+
+/* ---------- forms ---------- */
+function setBusy(form,button,busy){
+  $$("button",form).forEach(function(b){b.disabled=busy});
+  if(button)button.classList.toggle("loading",busy);
+  form.setAttribute("aria-busy",busy?"true":"false");
+}
+document.addEventListener("submit",function(e){
+  var form=e.target;
+  if(!form.classList||!form.classList.contains("js-form"))return;
+  e.preventDefault();
+  if(form.getAttribute("aria-busy")==="true")return;
+  var button=e.submitter||form.querySelector("button[type=submit],button:not([type])");
+  var text=(button&&button.dataset.confirm)||form.dataset.confirm;
+  var danger=(button&&button.dataset.danger)||form.dataset.danger;
+  (text?ask(text,!!danger):Promise.resolve(true)).then(function(ok){if(ok)send(form,button)});
+});
+function send(form,button){
+  var body=new URLSearchParams(new FormData(form));
+  if(button&&button.name)body.set(button.name,button.value);
+  setBusy(form,button,true);
+  return fetch(form.action,{method:"POST",credentials:"same-origin",headers:{"Accept":"application/json","Content-Type":"application/x-www-form-urlencoded;charset=UTF-8"},body:body})
+    .then(function(r){
+      if(r.status===401){location.reload();throw null;}
+      return r.json().catch(function(){throw new Error("Сервер вернул неожиданный ответ (HTTP "+r.status+").")})
+        .then(function(d){if(!r.ok||d.error)throw new Error(d.error||("HTTP "+r.status));return d;});
+    })
+    .then(function(d){
+      toast(d.message||"Готово.");
+      if(form.id==="compose-form"){try{sessionStorage.removeItem(DRAFT)}catch(_e){}}
+      if(d.status)renderStatus(d.status);
+      return refresh();
+    })
+    .catch(function(err){
+      if(!err)return;
+      var msg=err instanceof TypeError?"Нет связи с панелью. Проверьте подключение и попробуйте ещё раз.":(err.message||String(err));
+      toast(msg,"error");
+    })
+    .then(function(){setBusy(form,button,false)});
+}
+
+/* ---------- partial refresh ---------- */
+function refresh(){
+  return fetch(base+"/",{credentials:"same-origin",cache:"no-store",headers:{"Accept":"text/html"}})
+    .then(function(r){
+      if(r.status===401){location.reload();return;}
+      if(!r.ok)return;
+      return r.text().then(function(html){
+        var doc=new DOMParser().parseFromString(html,"text/html");
+        document.body.classList.add("no-anim");
+        $$(".view[data-refresh]").forEach(function(v){var fresh=doc.getElementById(v.id);if(fresh)v.innerHTML=fresh.innerHTML;});
+        ["side-ip","nav"].forEach(function(id){var a=byId(id),b=doc.getElementById(id);if(a&&b)a.innerHTML=b.innerHTML;});
+        show((location.hash||"#overview").slice(1),false);
+        document.body.classList.add("no-anim");
+        bindDynamic();
+        if(lastStatus)renderStatus(lastStatus);
+      });
+    }).catch(function(){});
+}
+
+/* ---------- status ---------- */
+function stateClass(s){return s==="running"?"ok":(s==="exited"||s==="dead"||s==="restarting")?"bad":"warn";}
+function stage(id,state,label){
+  var el=byId(id);if(!el)return;
+  el.className="stage"+(state?" "+state:"");
+  var b=el.querySelector("b");if(b&&label!=null&&b.textContent!==label)b.textContent=label;
+}
+var lastPhase=null,lastStatus=null;
+function renderStatus(d){
+  if(!d)return;
+  lastStatus=d;
+  var label=STATE[d.state]||d.state||"—",cls=stateClass(d.state);
+  var ov=byId("ov-state");if(ov){ov.textContent=label;ov.className=cls+"-t";}
+  var ovDot=byId("ov-dot");if(ovDot)ovDot.className="dot "+cls;
+  setText("ov-image",d.image);setText("ov-restarts",d.restarts);
+  var chipDot=byId("chip-dot");if(chipDot)chipDot.className="dot "+cls;
+  setText("chip-text",label);
+  var job=d.job||{},phase=job.phase||"idle";
+  var failed=phase==="failed"||phase==="interrupted";
+  var running=ACTIVE.indexOf(phase)>=0;
+  var current=failed?(ORDER[job.failed_phase]||1):(ORDER[phase]||0);
+  stage("st-compose",d.composeSaved?"done":"",d.composeSaved?"сохранён":"не сохранён");
+  var names=["st-image","st-deploy","st-verify"];
+  var labels=[job.tag?"remnawave/node:"+job.tag:"—",null,null];
+  names.forEach(function(id,i){
+    var idx=i+1,state="";
+    if(phase==="installed")state="done";
+    else if(failed||running){state=idx<current?"done":idx===current?(failed?"failed":"active"):"";}
+    var text=labels[i];
+    if(i===1)text=state==="done"?"контейнер создан":state==="active"?"запуск…":state==="failed"?"ошибка":"ожидание";
+    if(i===2)text=state==="active"?"жду running…":state==="failed"?"ошибка":(STATE[d.state]||d.state||"—");
+    stage(id,state,text);
+  });
+  var bar=byId("inst-progress");
+  if(bar){
+    var pct=failed?(PROGRESS[job.failed_phase]||20):(PROGRESS[phase]||0);
+    bar.className="progress"+(running?" running":"")+(failed?" failed":"");
+    var fill=bar.querySelector("i");if(fill)fill.style.width=pct+"%";
+    bar.setAttribute("aria-valuenow",String(pct));
+  }
+  var msg=byId("inst-msg");
+  if(msg){var html=(running?'<span class="spinner"></span>':"")+"<span>"+esc(job.message||"")+"</span>";if(msg.innerHTML!==html)msg.innerHTML=html;}
+  setText("inst-phase",PHASE[phase]||phase);
+  var log=byId("install-log");
+  if(log&&job.log!==undefined){
+    var text=job.log||"Здесь появится ход загрузки образа и запуска контейнера.";
+    if(log.textContent!==text){var bottom=log.scrollHeight-log.scrollTop-log.clientHeight<60;log.textContent=text;if(bottom)log.scrollTop=log.scrollHeight;}
+  }
+  if(lastPhase&&ACTIVE.indexOf(lastPhase)>=0&&!running&&phase!==lastPhase){
+    toast(job.message||PHASE[phase]||phase,phase==="installed"?"ok":"error");
+    refresh();
+  }
+  lastPhase=phase;
+}
+var pollTimer=null;
+function poll(){
+  clearTimeout(pollTimer);
+  var delay=6000;
+  fetch(base+"/api/status",{credentials:"same-origin",cache:"no-store",headers:{"Accept":"application/json"}})
+    .then(function(r){if(r.status===401){location.reload();return null;}return r.ok?r.json():null;})
+    .then(function(d){if(d){renderStatus(d);if(ACTIVE.indexOf((d.job||{}).phase)>=0)delay=1500;}})
+    .catch(function(){})
+    .then(function(){pollTimer=setTimeout(poll,document.hidden?Math.max(delay,15000):delay);});
+}
+document.addEventListener("visibilitychange",function(){if(!document.hidden)poll();});
+
+/* ---------- live logs ---------- */
+var stream=null,streamName="container",lineCount=0;
+function setLive(text,cls){var dot=byId("live-dot");if(dot)dot.className="dot "+(cls||"");setText("live-text",text);}
+function appendLine(line){
+  var live=byId("live-log");if(!live)return;
+  if(lineCount===0)live.textContent="";
+  var bottom=live.scrollHeight-live.scrollTop-live.clientHeight<80;
+  var row=document.createElement("span");
+  var low=String(line).toLowerCase();
+  row.className="l"+(/\b(error|fatal|panic|failed)\b|ошибк/.test(low)?" e":/\bwarn(ing)?\b/.test(low)?" w":/^\s*$/.test(low)?" s":"");
+  row.textContent=line;
+  live.appendChild(row);lineCount++;
+  while(live.childNodes.length>800)live.removeChild(live.firstChild);
+  if(bottom)live.scrollTop=live.scrollHeight;
+}
+function openStream(name){
+  if(stream){stream.close();stream=null;}
+  streamName=name;lineCount=0;
+  var live=byId("live-log");if(live)live.textContent="Подключаю поток логов…";
+  $$("[data-stream]").forEach(function(b){b.classList.toggle("active",b.dataset.stream===name)});
+  setLive("подключение…","warn");
+  stream=new EventSource(base+"/stream?source="+encodeURIComponent(name));
+  stream.addEventListener("ready",function(){setLive("в реальном времени","ok");if(lineCount===0&&live)live.textContent="Ждём новые строки…";});
+  stream.addEventListener("line",function(ev){var v;try{v=JSON.parse(ev.data)}catch(_e){v=ev.data}appendLine(v);});
+  stream.addEventListener("terminal",function(ev){var v="";try{v=JSON.parse(ev.data)}catch(_e){}if(v)appendLine(v);setLive("поток остановлен","bad");if(stream){stream.close();stream=null;}});
+  stream.onerror=function(){setLive("переподключение…","warn");};
+}
+function ensureStream(){if(!stream)openStream(streamName);}
+
+/* ---------- clipboard ---------- */
+function copyText(text){
+  if(navigator.clipboard&&window.isSecureContext)return navigator.clipboard.writeText(text).catch(function(){return legacyCopy(text)});
+  return legacyCopy(text);
+}
+function legacyCopy(text){
+  return new Promise(function(resolve,reject){
+    var ta=document.createElement("textarea");ta.value=text;ta.setAttribute("readonly","");
+    ta.style.position="fixed";ta.style.opacity="0";document.body.appendChild(ta);ta.select();
+    try{document.execCommand("copy")?resolve():reject(new Error("copy"))}catch(err){reject(err)}
+    ta.remove();
+  });
+}
+
+/* ---------- delegated clicks ---------- */
+document.addEventListener("click",function(e){
+  var copy=e.target.closest("[data-copy],[data-copy-target]");
+  if(copy){
+    e.preventDefault();
+    var src=copy.dataset.copyTarget?byId(copy.dataset.copyTarget):null;
+    var value=src?src.textContent:copy.dataset.copy;
+    copyText(value||"").then(function(){
+      toast("Скопировано в буфер обмена.");
+      var label=copy.querySelector("[data-label]");
+      if(label){var old=label.textContent;label.textContent="Скопировано";setTimeout(function(){label.textContent=old},1600);}
+    },function(){toast("Не удалось скопировать — выделите текст вручную.","error")});
+  }
+  var s=e.target.closest("[data-stream]");if(s)openStream(s.dataset.stream);
+  if(e.target.closest("[data-clear-log]")){var live=byId("live-log");if(live){live.textContent="";lineCount=0;}}
+  if(e.target.closest("[data-refresh-now]")){refresh().then(function(){toast("Данные обновлены.")});}
+});
+
+/* ---------- dynamic bits ---------- */
+function bindDynamic(){
+  var editor=byId("compose-editor");
+  if(editor&&!editor.dataset.bound){
+    editor.dataset.bound="1";
+    try{var saved=sessionStorage.getItem(DRAFT);if(!editor.value&&saved)editor.value=saved;}catch(_e){}
+    editor.addEventListener("input",function(){try{sessionStorage.setItem(DRAFT,editor.value)}catch(_e){}});
+  }
+  var kind=byId("inbound-kind"),tag=byId("inbound-tag");
+  if(kind&&tag&&!kind.dataset.bound){
+    kind.dataset.bound="1";
+    kind.addEventListener("change",function(){
+      if(tag.value==="VLESS_REALITY"||tag.value==="HYSTERIA2")tag.value=kind.value==="hysteria"?"HYSTERIA2":"VLESS_REALITY";
+      var port=byId("inbound-port");if(port&&(port.value==="2053"||port.value==="8444"))port.value=kind.value==="hysteria"?"8444":"2053";
+    });
+  }
+}
+
+/* ---------- boot ---------- */
+show((location.hash||"#overview").slice(1),false);
+bindDynamic();
+if(boot.flash){
+  if(boot.flash.ok)toast(boot.flash.ok);
+  if(boot.flash.error)toast(boot.flash.error,"error");
+  if((boot.flash.ok||boot.flash.error)&&history.replaceState)history.replaceState(null,"",location.pathname+location.hash);
+}
+if(boot.status)renderStatus(boot.status);
+poll();
+})();
+'''
+
+ICONS = {
+    "overview": '<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>',
+    "install": '<path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="m3 8 9 5 9-5M12 13v8"/>',
+    "tls": '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+    "inbound": '<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/>',
+    "network": '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
+    "ssh": '<circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.7 12.3 9.3-9.3M17 6l3 3M14 9l2 2"/>',
+    "meltun": '<path d="M12 15V3M7 8l5-5 5 5"/><path d="M5 15v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/>',
+    "logs": '<path d="m4 17 6-6-6-6M12 19h8"/>',
+    "moon": '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>',
+    "logout": '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>',
+    "check": '<path d="M20 6 9 17l-5-5"/>',
+    "copy": '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/>',
+    "arrow": '<path d="M5 12h14M13 6l6 6-6 6"/>',
+    "info": '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
+    "alert": '<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/>',
+    "play": '<path d="M7 4v16l13-8z"/>',
+    "restart": '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/>',
+    "download": '<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',
+    "globe": '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
+    "box": '<path d="M21 16V8l-9-5-9 5v8l9 5z"/>',
+    "refresh": '<path d="M21 12a9 9 0 0 1-15.5 6.2L3 16M3 12a9 9 0 0 1 15.5-6.2L21 8"/><path d="M21 3v5h-5M3 21v-5h5"/>',
+    "eye": '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+    "shield": '<path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/>',
+    "trash": '<path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/>',
+}
+LOGO = '<svg viewBox="0 0 36 36" aria-hidden="true"><defs><linearGradient id="nf-g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5eead4"/><stop offset="1" stop-color="#818cf8"/></linearGradient></defs><rect width="36" height="36" rx="11" fill="url(#nf-g)"/><path d="M11 25V11h4.2l5.6 8V11H25v14h-4.2l-5.6-8v8z" fill="#06121c"/></svg>'
+FAVICON = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 36 36'%3E%3Crect width='36' height='36' rx='11' fill='%235eead4'/%3E%3Cpath d='M11 25V11h4.2l5.6 8V11H25v14h-4.2l-5.6-8v8z' fill='%2306121c'/%3E%3C/svg%3E"
+FONT_LINKS = '<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap">'
+STATE_LABELS = {
+    "running": "работает", "exited": "остановлена", "restarting": "перезапускается",
+    "created": "создана", "paused": "на паузе", "dead": "сломана", "removing": "удаляется",
+    "not created": "не создана",
+}
+PHASE_LABELS = {
+    "idle": "не запускалась", "queued": "в очереди", "pulling": "загрузка образа",
+    "starting": "запуск контейнера", "verifying": "проверка", "installed": "установлена",
+    "failed": "ошибка", "interrupted": "прервана",
+}
+CSP = (
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
+    "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+)
+
+
+def icon(name):
+    return f'<svg class="ic" viewBox="0 0 24 24" aria-hidden="true">{ICONS[name]}</svg>'
+
+
+def render_page(title, body, boot=None, script=""):
+    boot_json = json.dumps(boot or {}, ensure_ascii=False).replace("</", "<\\/")
+    return (
+        '<!doctype html><html lang="ru"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        '<meta name="color-scheme" content="dark light"><meta name="robots" content="noindex,nofollow">'
+        f'<title>{html.escape(title)}</title><link rel="icon" href="{FAVICON}">{FONT_LINKS}'
+        f'<style>{CSS}</style><script>{THEME_JS}</script></head><body>'
+        '<div class="aurora" aria-hidden="true"></div><div class="grain" aria-hidden="true"></div>'
+        f'{body}<script id="boot" type="application/json">{boot_json}</script>'
+        f'<script>{COMMON_JS}</script>{f"<script>{script}</script>" if script else ""}</body></html>'
+    )
 
 
 def render_login(error=""):
-    return f'''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Node Forge login</title><style>{CSS}.login{{max-width:460px;margin:12vh auto;padding:28px;background:var(--panel);border:1px solid var(--line)}}.login h1{{font-size:48px}}</style><div class="login"><div class="eyebrow">Meltun infrastructure</div><h1>Node<br>Forge</h1>{f'<p class="error">{html.escape(error)}</p>' if error else ''}<form method="post" action="{web_path('login')}"><label>Пароль администратора</label><input autofocus type="password" name="password" autocomplete="current-password"><button style="margin-top:16px">Открыть панель</button></form><p class="muted">Одноразовый код подключения ноды можно ввести без сертификата. При HTTP пароль этой панели передаётся без шифрования.</p></div></html>'''
+    error_html = f'<div class="form-error" role="alert">{icon("alert")}<span>{html.escape(error)}</span></div>' if error else ""
+    body = f'''<main class="login"><div class="login-card{' shake' if error else ''}">
+<div class="brand">{LOGO}<div><b>Node Forge</b><small>Meltun · управление нодой</small></div></div>
+<h1>Вход в панель</h1><p class="sub" style="margin-bottom:22px">Пароль сохранён на сервере в <code>/root/remnanode-manager-access.txt</code>.</p>
+{error_html}<form method="post" action="{web_path('login')}">
+<label class="field"><span>Пароль администратора</span><div class="pw"><input id="password" autofocus type="password" name="password" autocomplete="current-password" required>
+<button type="button" data-reveal="password" aria-label="Показать пароль">{icon("eye")}</button></div></label>
+<button class="btn" type="submit">Открыть панель {icon("arrow")}</button></form>
+<div class="notice">{icon("info")}<span>При входе по HTTP пароль передаётся без шифрования. Для постоянной работы откройте панель по HTTPS-домену ноды или через SSH-туннель.</span></div>
+</div></main>'''
+    return render_page("Вход · Node Forge", body)
 
 
-def render_dashboard(message="", error=""):
+def stat_card(icon_name, key, value, hint, value_class="", extra=""):
+    return (
+        f'<div class="card stat span-3"><div class="k">{icon(icon_name)}{key}</div>'
+        f'<div class="v {value_class}">{value}</div><div class="h">{hint}</div>{extra}</div>'
+    )
+
+
+def card_head(eyebrow, title, subtitle="", right=""):
+    sub = f'<p class="sub">{subtitle}</p>' if subtitle else ""
+    return f'<div class="card-head"><div><div class="eyebrow">{eyebrow}</div><h2>{title}</h2>{sub}</div>{right}</div>'
+
+
+def notice(text, kind="", icon_name="info"):
+    return f'<div class="notice {kind}">{icon(icon_name)}<span>{text}</span></div>'
+
+
+def render_dashboard(csrf, message="", error=""):
+    e = html.escape
     s = status_data()
+    runtime = runtime_status()
     addresses = server_addresses(public_ip=s["public_ip"])
-    selected_address = s["public_ip"] if any(item["value"] == s["public_ip"] for item in addresses) else (addresses[0]["value"] if addresses else "")
-    address_options = "".join(
-        f'<option value="{html.escape(item["value"])}" {"selected" if item["value"] == selected_address else ""}>{html.escape(item["value"])} · {html.escape(item["source"])} · {item["family"]}</option>'
-        for item in addresses
-    ) or '<option value="">Адреса не найдены — обнови страницу</option>'
-    compose_text = COMPOSE_FILE.read_text(encoding="utf-8") if COMPOSE_FILE.exists() else ""
-    forwarder_config = json.loads(ACCESS_FORWARDER_CONFIG.read_text()) if ACCESS_FORWARDER_CONFIG.exists() else {}
+    sites = managed_sites()
+    owners_443 = sorted(port_owners(443))
+    job = install_snapshot()
     tags = image_tags()
+    forwarder_config = {}
+    if ACCESS_FORWARDER_CONFIG.exists():
+        try:
+            forwarder_config = json.loads(ACCESS_FORWARDER_CONFIG.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            forwarder_config = {}
+    forwarder_active = command_ok(["systemctl", "is-active", "--quiet", "remnanode-access-forwarder.service"])
+    last = (STATE_DIR / "last-inbound.json").read_text(encoding="utf-8") if (STATE_DIR / "last-inbound.json").exists() else ""
+    try:
+        meta = json.loads((STATE_DIR / "last-meta.json").read_text(encoding="utf-8")) if (STATE_DIR / "last-meta.json").exists() else {}
+    except ValueError:
+        meta = {}
+    compose_text = COMPOSE_FILE.read_text(encoding="utf-8") if COMPOSE_FILE.exists() else ""
+    hidden = f'<input type="hidden" name="csrf" value="{e(csrf)}">'
+    ssh = s["ssh"]
+    state = s["state"]
+    state_label = STATE_LABELS.get(state, state)
+    state_cls = "ok" if state == "running" else ("bad" if state in ("exited", "dead", "restarting") else "warn")
     selected_tag = s["image"].rsplit(":", 1)[-1] if s["image"].startswith("remnawave/node:") else "latest"
+    if selected_tag not in tags:
+        tags = tags + [selected_tag]
     tag_options = "".join(
-        f'<option value="{html.escape(tag)}" {"selected" if tag == selected_tag else ""}>{html.escape(tag)}{" · latest" if tag == "latest" else ""}</option>'
+        f'<option value="{e(tag)}"{" selected" if tag == selected_tag else ""}>{e(tag)}{" — последняя" if tag == "latest" else ""}</option>'
         for tag in tags
     )
-    job = install_snapshot()
-    last = (STATE_DIR / "last-inbound.json").read_text(encoding="utf-8") if (STATE_DIR / "last-inbound.json").exists() else ""
-    meta = json.loads((STATE_DIR / "last-meta.json").read_text()) if (STATE_DIR / "last-meta.json").exists() else {}
-    certs = "".join(f'<span class="pill">{html.escape(x)}</span>' for x in s["certs"]) or '<span class="muted">Пока нет</span>'
-    https_domains = [domain for domain in s["certs"] if (Path("/etc/nginx/sites-available") / f"rnm-{domain}.conf").exists()]
-    https_links = " ".join(f'<a class="button secondary" href="https://{html.escape(domain)}{web_path()}">https://{html.escape(domain)}{web_path()}</a>' for domain in https_domains)
-    https_links = f'<p class="muted">Если у ноды уже есть домен с TLS, панель доступна и по HTTPS:</p><div class="actions">{https_links}</div>' if https_links else ""
-    ssh = s["ssh"]
-    ssh_ports = ", ".join(map(str, ssh["ports"])) or "unknown"
-    ssh_port_value = ssh["desired_port"] or (ssh["ports"][0] if ssh["ports"] else 22)
-    ssh_keys = "<br>".join(html.escape(item) for item in ssh["fingerprints"]) or "Ключи root пока не найдены"
+    selected_address = s["public_ip"] if any(item["value"] == s["public_ip"] for item in addresses) else (addresses[0]["value"] if addresses else "")
+    address_options = "".join(
+        f'<option value="{e(item["value"])}"{" selected" if item["value"] == selected_address else ""}>{e(item["value"])} · {e(item["source"])} · {item["family"]}</option>'
+        for item in addresses
+    ) or '<option value="">Адреса не найдены — обновите страницу</option>'
+    public_sites = [site for site in sites if site["public_https"]]
     ssh_password_on = ssh["root_login"] == "yes" and (ssh["password_auth"] == "yes" or ssh["kbd_auth"] == "yes")
+    ssh_ports = ", ".join(map(str, ssh["ports"])) or "неизвестно"
+    ssh_port_value = ssh["desired_port"] or (ssh["ports"][0] if ssh["ports"] else 22)
+    port443_text = ", ".join(owners_443) if owners_443 else "свободен"
+    port443_hint = (
+        "занят nginx — Xray не сможет слушать 443" if owners_443 == ["nginx"]
+        else "свободен для inbound Xray" if not owners_443
+        else "слушает inbound ноды"
+    )
+
+    # ---- overview ----
+    steps = [
+        ("install", "Сохранить Docker Compose", "Скопируйте его из карточки ноды в Remnawave", COMPOSE_FILE.exists()),
+        ("install", "Установить RemnaNode", "Выберите версию образа и запустите контейнер", state == "running"),
+        ("tls", "Выпустить сертификат", "Нужен для Reality self-steal и Hysteria 2", bool(s["certs"])),
+        ("inbound", "Сгенерировать inbound", "Вставьте JSON в профиль Xray панели", bool(last)),
+        ("meltun", "Подключить MelTun", "История подключений пользователей", bool(forwarder_config)),
+        ("ssh", "Закрыть SSH ключом", "Новый порт и вход только по ключу", ssh["key_count"] > 0 and not ssh_password_on),
+    ]
+    steps_html = "".join(
+        f'<li class="{"done" if done else ""}"><a href="#{view}"><span class="n">{icon("check") if done else index}</span>'
+        f'<span><b>{title}</b><small>{hint}</small></span><span class="go">{icon("arrow")}</span></a></li>'
+        for index, (view, title, hint, done) in enumerate(steps, 1)
+    )
+    done_count = sum(1 for step in steps if step[3])
+    overview = f'''
+<div class="grid">
+{stat_card("box", "RemnaNode", f'<span id="ov-dot" class="dot {state_cls}"></span><span id="ov-state" class="{state_cls}-t">{e(state_label)}</span>', f'Перезапусков: <span id="ov-restarts">{e(s["restarts"])}</span>')}
+{stat_card("install", "Образ", f'<span id="ov-image">{e(s["image"])}</span>', f'Docker {e(s["docker"])} · Compose {e(s["compose"])}', "mono")}
+{stat_card("globe", "Публичный IP", e(s["public_ip"]), "исходящий адрес сервера", "mono")}
+{stat_card("shield", "TCP 443", e(port443_text), port443_hint, "mono")}
+</div>
+<div class="grid">
+<section class="card span-7">{card_head("Быстрый старт", "Настройка ноды", f"Готово {done_count} из {len(steps)} шагов. Нажмите на шаг, чтобы перейти к нему.")}<ol class="steps">{steps_html}</ol></section>
+<div class="span-5" style="display:grid;gap:16px;align-content:start">
+<section class="card" style="margin:0">{card_head("Контейнер", "Управление нодой", "Команды выполняются в /opt/remnanode.")}
+<form class="js-form" method="post" action="{web_path('action')}">{hidden}<div class="actions tight">
+<button class="btn" name="action" value="start">{icon("play")}Запустить</button>
+<button class="btn ghost" name="action" value="restart" data-confirm="Перезапустить контейнер remnanode? Активные подключения пользователей прервутся.">{icon("restart")}Перезапустить</button>
+<button class="btn ghost" name="action" value="pull" data-confirm="Скачать свежий образ и пересоздать контейнер? Подключения на время прервутся.">{icon("download")}Обновить образ</button>
+</div></form></section>
+<section class="card" style="margin:0">{card_head("Система", "Сводка")}<div class="kv">
+<div><span>Сеть</span><b>{e(s["bbr"])} · {e(s["qdisc"])}</b></div>
+<div><span>SSH-порты</span><b>{e(ssh_ports)}</b></div>
+<div><span>Вход root по паролю</span><b class="{'warn-t' if ssh_password_on else 'ok-t'}">{'разрешён' if ssh_password_on else 'выключен'}</b></div>
+<div><span>Сертификаты</span><b>{len(s["certs"])}</b></div>
+<div><span>Compose SHA-256</span><b>{e(s["compose_hash"])}</b></div>
+<div><span>MelTun</span><b class="{'ok-t' if forwarder_active else 'faint'}">{'передаёт логи' if forwarder_active else ('настроен, служба остановлена' if forwarder_config else 'не подключён')}</b></div>
+</div></section></div></div>'''
+
+    # ---- install ----
+    install = f'''
+<section class="card">{card_head("Шаг 1 · Конфигурация", "Docker Compose", "Вставьте полный <code>docker-compose.yml</code> из карточки ноды в Remnawave. Сохранение только проверяет и записывает файл — контейнер не запускается.", f'<span class="pill {"ok" if COMPOSE_FILE.exists() else "warn"}">{"сохранён" if COMPOSE_FILE.exists() else "не сохранён"}</span>')}
+<form id="compose-form" class="js-form" method="post" action="{web_path('compose')}">{hidden}
+<label class="field"><span>docker-compose.yml</span><textarea id="compose-editor" name="compose" spellcheck="false" placeholder="services:&#10;  remnanode:&#10;    container_name: remnanode&#10;    image: remnawave/node:latest&#10;    network_mode: host&#10;    ...">{e(compose_text)}</textarea></label>
+<label class="check"><input type="checkbox" name="cert_volume" value="1" checked><span>Подключить каталог сертификатов к контейнеру<small>/var/lib/remnawave/configs/xray/ssl монтируется только для чтения.</small></span></label>
+<div class="actions"><button class="btn" type="submit">{icon("check")}Проверить и сохранить</button><span class="faint mono" style="font-size:12px">/opt/remnanode · SHA-256 {e(s["compose_hash"])}</span></div></form></section>
+<section class="card">{card_head("Шаг 2 · Установка", "Версия и запуск", "Образ скачивается в фоне — страницу можно не держать открытой.", f'<span class="pill" id="inst-phase">{e(PHASE_LABELS.get(job.get("phase", "idle"), job.get("phase", "")))}</span>')}
+<form class="js-form" method="post" action="{web_path('api/install')}">{hidden}<div class="cols" style="align-items:end">
+<label class="field"><span>Версия образа remnawave/node</span><select name="version">{tag_options}</select></label>
+<div class="field"><button class="btn" type="submit" style="width:100%">{icon("download")}Установить выбранную версию</button></div></div></form>
+<div class="pipeline">
+<div class="stage" id="st-compose"><small><i></i>01 · Compose</small><b>—</b></div>
+<div class="stage" id="st-image"><small><i></i>02 · Образ</small><b>—</b></div>
+<div class="stage" id="st-deploy"><small><i></i>03 · Запуск</small><b>—</b></div>
+<div class="stage" id="st-verify"><small><i></i>04 · Проверка</small><b>—</b></div></div>
+<div class="progress" id="inst-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100"><i></i></div>
+<div class="job-msg" id="inst-msg">{e(job.get("message", ""))}</div>
+<pre class="term" id="install-log">{e(job.get("log", "") or "Здесь появится ход загрузки образа и запуска контейнера.")}</pre></section>'''
+
+    # ---- certificates ----
+    if sites:
+        rows = []
+        for site in sites:
+            days = site["days_left"]
+            if days is None:
+                expiry = '<span class="pill">—</span>'
+            else:
+                expiry = f'<span class="pill {"ok" if days > 20 else "warn" if days > 7 else "bad"}">ещё {days} дн.</span>'
+            if not site["tls"]:
+                toggle = '<span class="faint">только HTTP</span>'
+            else:
+                enable = "0" if site["public_https"] else "1"
+                question = (
+                    f"Отключить публичный HTTPS для {site['domain']}? nginx освободит TCP 443, сайт и панель по HTTPS станут недоступны."
+                    if site["public_https"] else
+                    f"Включить публичный HTTPS для {site['domain']}? nginx займёт TCP 443 — inbound Xray на 443 после этого не запустится."
+                )
+                toggle = (
+                    f'<form class="js-form" method="post" action="{web_path("public-https")}" data-confirm="{e(question)}">{hidden}'
+                    f'<input type="hidden" name="domain" value="{e(site["domain"])}"><input type="hidden" name="enabled" value="{enable}">'
+                    f'<button class="btn small {"ghost" if site["public_https"] else ""}" type="submit">{"Освободить 443" if site["public_https"] else "Включить 443"}</button></form>'
+                )
+            link = (
+                f'<a class="mono site-link" href="https://{e(site["domain"])}{web_path()}">https://{e(site["domain"])}{web_path()}</a>'
+                if site["public_https"] else '<span class="faint">Панель по HTTPS выключена</span>'
+            )
+            if site["public_https"]:
+                listeners = '<span class="pill ok">443 + 8443</span>'
+            elif site["tls"]:
+                listeners = '<span class="pill">только 8443</span>'
+            else:
+                listeners = '<span class="pill warn">только HTTP</span>'
+            rows.append(
+                f'<div class="site"><div class="site-row"><b class="mono">{e(site["domain"])}</b>'
+                f'<span class="pills">{expiry}{listeners}</span></div>'
+                f'<div class="site-row">{link}{toggle}</div></div>'
+            )
+        sites_html = f'<div class="sites">{"".join(rows)}</div>'
+    else:
+        sites_html = f'<div class="empty">{icon("tls")}<span>Сертификатов пока нет.</span></div>'
+    owner_note = (
+        notice("<b>TCP 443 занят nginx.</b> Если Reality или другой inbound должен слушать 443, нажмите «Освободить 443» у домена — заглушка Reality останется на 127.0.0.1:8443.", "warn", "alert")
+        if owners_443 == ["nginx"] else
+        notice(f"TCP 443 сейчас: <b>{e(port443_text)}</b>. Публичный HTTPS-сайт включайте, только если Xray не использует 443.")
+    )
+    certificates = f'''
+<div class="grid">
+<section class="card span-7">{card_head("Let's Encrypt", "Выпустить сертификат", "Домен проверяется по DNS, сертификат выпускается через HTTP-01 на порту 80 и копируется в каталог Xray.")}
+<form class="js-form" method="post" action="{web_path('cert')}">{hidden}
+<div class="cols"><label class="field"><span>Домен</span><input name="domain" placeholder="node.example.com" required autocomplete="off" spellcheck="false"></label>
+<label class="field"><span>Email для Let's Encrypt</span><input type="email" name="email" placeholder="admin@example.com" required></label></div>
+<label class="field"><span>IP сервера для проверки DNS</span><select name="expected_ip" required>{address_options}</select><p class="hint">Выбранный адрес сравнивается с A/AAAA-записями домена. Если записей несколько, каждая должна вести на этот сервер.</p></label>
+<label class="check"><input type="checkbox" name="cert_volume" value="1" checked><span>Добавить volume сертификатов в сохранённый Compose</span></label>
+<label class="check"><input type="checkbox" name="public_https" value="1"><span>Открыть сайт и панель на публичном TCP 443<small>Не включайте, если inbound Xray (например Reality) слушает 443.</small></span></label>
+<label class="check"><input type="checkbox" name="restart_node" value="1"><span>Перезапустить работающую ноду после выпуска</span></label>
+<label class="check"><input type="checkbox" name="force_dns" value="1"><span>Игнорировать несовпадение DNS и выбранного IP<small>Только если домен за прокси или DNS ещё не обновился.</small></span></label>
+<div class="actions"><button class="btn" type="submit">{icon("tls")}Проверить DNS и выпустить</button></div></form></section>
+<section class="card span-5">{card_head("Хранилище", "Сертификаты ноды", "Продлеваются certbot.timer, deploy-hook копирует их в Xray и перезапускает ноду.")}{sites_html}{owner_note}</section>
+</div>'''
+
+    # ---- inbound ----
+    cert_options = "".join(f'<option value="{e(domain)}">' for domain in s["certs"])
+    if last:
+        meta_pills = ""
+        if meta.get("publicKey"):
+            meta_pills = (
+                f'<div class="pills" style="margin-top:14px">'
+                f'<button class="pill fp" type="button" data-copy="{e(meta.get("publicKey", ""))}" title="Скопировать">{icon("copy")}Public key · {e(meta.get("publicKey", ""))}</button>'
+                f'<button class="pill fp" type="button" data-copy="{e(meta.get("shortId", ""))}" title="Скопировать">{icon("copy")}Short ID · {e(meta.get("shortId", ""))}</button></div>'
+            )
+        result = (
+            f'<div class="code-wrap"><button class="btn small ghost" type="button" data-copy-target="inbound-json">{icon("copy")}<span data-label>Копировать</span></button>'
+            f'<pre class="term" id="inbound-json">{e(last)}</pre></div>{meta_pills}'
+        )
+    else:
+        result = f'<div class="empty">{icon("inbound")}<span>Сгенерированный inbound появится здесь.</span></div>'
+    inbound = f'''
+<div class="grid">
+<section class="card span-5">{card_head("Профиль Xray", "Сгенерировать inbound", "JSON вставляется в конфигурационный профиль ноды в панели Remnawave. На сервере он сам не применяется.")}
+<form class="js-form" method="post" action="{web_path('inbound')}">{hidden}
+<label class="field"><span>Тип</span><select name="kind" id="inbound-kind"><option value="reality">VLESS TCP Reality + self-steal</option><option value="hysteria">Hysteria 2 + TLS</option></select></label>
+<div class="cols"><label class="field"><span>Tag</span><input name="tag" id="inbound-tag" value="VLESS_REALITY" class="mono-in"></label>
+<label class="field"><span>Порт</span><input type="number" min="1" max="65535" name="inbound_port" id="inbound-port" value="2053" class="mono-in"></label></div>
+<label class="field"><span>Домен с сертификатом</span><input name="inbound_domain" list="cert-domains" placeholder="node.example.com" required autocomplete="off" spellcheck="false"><datalist id="cert-domains">{cert_options}</datalist>
+<p class="hint">Reality берёт этот домен как SNI и маскируется под TLS-сайт на 127.0.0.1:8443, поэтому сертификат нужен заранее.</p></label>
+<div class="actions"><button class="btn" type="submit">{icon("inbound")}Сгенерировать</button></div></form>
+{notice("Порты 80, 8443, порт панели и SSH заняты. Порт 443 доступен Reality, только если nginx его не держит.")}</section>
+<section class="card span-7">{card_head("Результат", "Последний inbound")}{result}</section>
+</div>'''
+
+    # ---- network ----
+    switches = [
+        ("bbr", "BBR + fq", "Алгоритм перегрузки TCP от Google и очередь fq.", s["bbr"] == "bbr", f'сейчас: <code>{e(s["bbr"])} / {e(s["qdisc"])}</code>'),
+        ("fastopen", "TCP Fast Open", "Экономит RTT на повторных TCP-подключениях.", s["fastopen"] == "3", f'сейчас: <code>{e(s["fastopen"])}</code>'),
+        ("mtu", "MTU probing", "Помогает при «чёрных дырах» MTU у провайдеров.", s["mtu_probing"] == "1", f'сейчас: <code>{e(s["mtu_probing"])}</code>'),
+        ("buffers", "VPN-буферы 16 MiB", "Увеличивает окна TCP для быстрых каналов.", s["rmem_max"] == "16777216", f'rmem_max: <code>{e(s["rmem_max"])}</code>'),
+        ("backlog", "Очереди 8192", "netdev_max_backlog и somaxconn для пиков нагрузки.", s["backlog"] == "8192", f'backlog: <code>{e(s["backlog"])}</code>'),
+    ]
+    switches_html = "".join(
+        f'<label class="switch-row"><span><b>{title}</b><small>{hint} {now}</small></span>'
+        f'<input class="switch" type="checkbox" name="{name}" value="1"{" checked" if on else ""}></label>'
+        for name, title, hint, on, now in switches
+    )
+    network = f'''
+<div class="grid">
+<section class="card span-7">{card_head("sysctl", "Параметры ядра", "Каждый переключатель применяется сразу после сохранения. Выключенный — возвращает значение, которое было до установки панели.")}
+<form class="js-form" method="post" action="{web_path('network')}">{hidden}<div>{switches_html}</div>
+<div class="actions"><button class="btn" type="submit">{icon("check")}Применить</button></div></form></section>
+<section class="card span-5">{card_head("Где хранится", "Файлы и откат")}<div class="kv">
+<div><span>Настройки</span><b>/etc/sysctl.d/99-remnanode-manager-network.conf</b></div>
+<div><span>Исходные значения</span><b>/var/lib/remnanode-manager/network-baseline.json</b></div>
+<div><span>Резервные копии</span><b>/var/lib/remnanode-manager/backups</b></div></div>
+{notice("Перед каждым изменением сохраняется резервная копия файлов sysctl.")}</section>
+</div>'''
+
+    # ---- ssh ----
+    fingerprints = "".join(f'<div class="pill fp">{e(item)}</div>' for item in ssh["fingerprints"])
+    fingerprints = fingerprints or '<span class="faint">Ключи root пока не найдены.</span>'
     ssh_finalize = ""
     if ssh["phase"] == "staged":
-        ssh_finalize = f'''<div class="ssh-confirm"><p class="warn"><b>Сначала открой вторую SSH-сессию на порту {ssh_port_value}.</b> Старые порты пока оставлены специально.</p><form method="post" action="{web_path('ssh-finalize')}" onsubmit="return confirm('Оставить только новый SSH-порт?')"><input type="hidden" name="csrf" value="{csrf_token()}"><label>Для подтверждения введи новый порт</label><div class="row"><input name="confirm_port" inputmode="numeric" placeholder="{ssh_port_value}" required><button class="danger">Оставить только {ssh_port_value}</button></div></form></div>'''
-    ssh_rollback = f'''<form method="post" action="{web_path('ssh-rollback')}" onsubmit="return confirm('Вернуть SSH-настройки из резервной копии?')"><input type="hidden" name="csrf" value="{csrf_token()}"><button class="secondary">Откатить SSH</button></form>''' if ssh["backup"] else ""
-    flash = f'<div class="flash">{html.escape(message)}</div>' if message else ""
-    flash += f'<div class="flash error">{html.escape(error)}</div>' if error else ""
-    inbound = f'''<div class="copybox"><button class="secondary" onclick="copyInbound();return false">Копировать</button><pre id="inbound">{html.escape(last)}</pre></div><p class="mono muted">Public key: {html.escape(meta.get('publicKey','—'))} · Short ID: {html.escape(meta.get('shortId','—'))}</p>''' if last else '<p class="muted">Сгенерированный inbound появится здесь.</p>'
-    return f'''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Node Forge</title><style>{CSS}</style><div class="shell"><header class="mast"><div><div class="eyebrow">Meltun infrastructure / node workshop</div><h1>Node Forge</h1></div><div class="rail"><span class="pulse"></span>{html.escape(s['public_ip'])} · secret path</div></header>{flash}<main class="grid">
-<section class="card"><div class="label">Runtime</div><h2>Состояние узла</h2><div class="metric"><span>RemnaNode</span><b id="node-state" class="{'ok' if s['state']=='running' else 'warn'}">{html.escape(s['state'])}</b></div><div class="metric"><span>Образ</span><b id="node-image">{html.escape(s['image'])}</b></div><div class="metric"><span>Перезапуски</span><b id="node-restarts">{html.escape(s['restarts'])}</b></div><div class="metric"><span>Docker / Compose</span><b>{html.escape(s['docker'])} / {html.escape(s['compose'])}</b></div><div class="actions"><form method="post" action="{web_path('action')}"><input type="hidden" name="csrf" value="{csrf_token()}"><button name="action" value="start">Запустить</button><button class="secondary" name="action" value="restart">Перезапустить</button><button class="secondary" name="action" value="pull">Обновить</button></form></div></section>
-<section class="card"><div class="label">Kernel controls</div><h2>Сеть</h2><div class="metric"><span>Congestion</span><b class="ok">{html.escape(s['bbr'])}</b></div><div class="metric"><span>Queue</span><b>{html.escape(s['qdisc'])}</b></div><div class="metric"><span>Fast Open / MTU</span><b>{html.escape(s['fastopen'])} / {html.escape(s['mtu_probing'])}</b></div><form method="post" action="{web_path('network')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label class="check"><input type="checkbox" name="bbr" value="1" {'checked' if s['bbr']=='bbr' else ''}> BBR + fq</label><label class="check"><input type="checkbox" name="fastopen" value="1" {'checked' if s['fastopen']=='3' else ''}> TCP Fast Open</label><label class="check"><input type="checkbox" name="mtu" value="1" {'checked' if s['mtu_probing']=='1' else ''}> MTU probing</label><label class="check"><input type="checkbox" name="buffers" value="1" {'checked' if s['rmem_max']=='16777216' else ''}> VPN-буферы 16 MiB</label><label class="check"><input type="checkbox" name="backlog" value="1" {'checked' if s['backlog']=='8192' else ''}> Очереди 8192</label><button style="margin-top:16px">Применить переключатели</button></form><p class="muted">Снятый флажок возвращает значение, которое было до установки панели.</p></section>
-<section class="card"><div class="label">Certificates</div><h2>Хранилище TLS</h2><div class="certs">{certs}</div><p class="muted">Файлы копируются в каталог Xray и обновляются deploy-hook’ом Certbot.</p></section>
-<section class="card full"><div class="label">Access control</div><h2>SSH: ключ, порт и пароль</h2><div class="row"><div class="metric"><span>Порты сейчас</span><b>{html.escape(ssh_ports)}</b></div><div class="metric"><span>Пароль root</span><b class="{'ok' if ssh_password_on else 'warn'}">{'разрешён' if ssh_password_on else 'выключен'}</b></div><div class="metric"><span>Ключей root</span><b>{ssh['key_count']}</b></div><div class="metric"><span>Этап</span><b>{html.escape(ssh['phase'])}</b></div></div><form method="post" action="{web_path('ssh')}"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Новый SSH-порт</label><input type="number" min="1" max="65535" name="ssh_port" value="{ssh_port_value}" required></div><div><label class="check ssh-password"><input type="checkbox" name="password_auth" value="1" {'checked' if ssh_password_on else ''}> Разрешить root вход по паролю</label><p class="muted">Если снять флажок, останется только вход по ключу.</p></div></div><label>Публичный OpenSSH-ключ root</label><textarea class="ssh-key" name="public_key" spellcheck="false" placeholder="ssh-ed25519 AAAAC3... comment"></textarea><p class="mono muted">{ssh_keys}</p><div class="actions"><button>Подготовить SSH безопасно</button></div></form><div class="actions">{ssh_rollback}</div>{ssh_finalize}<p class="muted">На первом этапе новый и текущий порты работают параллельно. Старый порт убирается только после отдельного подтверждения. Перед каждым изменением создаётся резервная копия.</p></section>
-<section class="card wide"><div class="label">01 / Configuration</div><h2>Сохранить Docker Compose</h2><form method="post" action="{web_path('compose')}"><input type="hidden" name="csrf" value="{csrf_token()}"><textarea id="compose-editor" name="compose" spellcheck="false" placeholder="Вставь полный docker-compose.yml из Remnawave">{html.escape(compose_text)}</textarea><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Подключить каталог сертификатов к контейнеру</label><button>Проверить и сохранить</button></form><p class="mono muted">Каталог: /opt/remnanode · SHA-256: {html.escape(s['compose_hash'])}. Сохранение ещё не запускает контейнер.</p></section>
-<section class="card wide"><div class="label">Access logs</div><h2>Передавать подключения в Meltun</h2><p>В веб-админке MelTun откройте «Ноды → Сбор логов Xray», укажите ID и публичный IP этой ноды и получите одноразовый код. Домен и сертификат ноде не нужны.</p>{https_links}<form method="post" action="{web_path('access-forwarder')}"><input type="hidden" name="csrf" value="{csrf_token()}"><input type="hidden" name="endpoint" value="https://meltun.org/api/admin/node-logs/ingest"><label>ID ноды — точно такой же, как при выдаче кода в MelTun</label><input name="node_id" value="{html.escape(forwarder_config.get('node_id', ''))}" placeholder="GERMANY" required><label>Часовой пояс логов Xray</label><select name="log_timezone"><option value="UTC" {'selected' if forwarder_config.get('log_timezone', 'UTC') == 'UTC' else ''}>UTC</option><option value="Europe/Moscow" {'selected' if forwarder_config.get('log_timezone') == 'Europe/Moscow' else ''}>Europe/Moscow</option></select><label>Одноразовый код из MelTun</label><input name="pair_code" type="password" autocomplete="off" placeholder="Код действует 10 минут" required><button>Подключить ноду</button></form><p class="muted">Нода сама получит рабочий ключ по исходящему HTTPS и сохранит его локально. В конфигурационном профиле Xray панели задайте log.access = /var/log/remnanode/access.log. Изменение Compose-монтирования требует пересоздания контейнера.</p></section>
-<section class="card"><div class="label">02 / Certificate · optional</div><h2>Выпустить сертификат</h2><form method="post" action="{web_path('cert')}"><input type="hidden" name="csrf" value="{csrf_token()}"><label>Домен</label><input name="domain" placeholder="node.example.com" required><label>IP сервера для проверки DNS</label><select name="expected_ip" required>{address_options}</select><p class="muted">Выбранный адрес сравнивается с A/AAAA домена. Если записей несколько, для надёжного HTTP-01 каждый опубликованный адрес должен принимать запросы этого домена на порту 80.</p><label>Email Let's Encrypt</label><input type="email" name="email" required><label class="check"><input type="checkbox" name="cert_volume" value="1" checked> Добавить volume в сохранённый Compose</label><label class="check"><input type="checkbox" name="restart_node" value="1"> Перезапустить уже работающую ноду</label><label class="check"><input type="checkbox" name="force_dns" value="1"> Игнорировать несовпадение выбранного IP и DNS</label><button>Проверить DNS и выпустить</button></form></section>
-<section class="card full"><div class="label">03 / Installation</div><h2>Выбрать версию и установить</h2><form id="install-form" action="{web_path('api/install')}" method="post"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Версия образа</label><select name="version">{tag_options}</select></div><div style="align-self:end"><button id="install-button">Начать установку</button></div></div></form><div class="pipeline"><div class="stage"><small>01 Compose</small><b id="step-compose">{'готов' if COMPOSE_FILE.exists() else 'не сохранён'}</b></div><div class="stage"><small>02 Image</small><b id="step-image">{html.escape(job.get('tag') or selected_tag)}</b></div><div class="stage"><small>03 Deploy</small><b id="step-deploy">{html.escape(job.get('phase','idle'))}</b></div><div class="stage"><small>04 Runtime</small><b id="step-runtime">{html.escape(s['state'])}</b></div></div><p id="install-message" class="mono muted">{html.escape(job.get('message','Installation has not started.'))}</p><pre id="install-log">{html.escape(job.get('log','') or 'Здесь появится ход загрузки образа и запуска контейнера.')}</pre></section>
-<section class="card full"><div class="label">04 / Profile builder</div><h2>Сгенерировать inbound</h2><form method="post" action="{web_path('inbound')}"><input type="hidden" name="csrf" value="{csrf_token()}"><div class="row"><div><label>Тип</label><select name="kind"><option value="reality">VLESS TCP Reality + self-steal</option><option value="hysteria">Hysteria 2 TLS</option></select></div><div><label>Tag</label><input name="tag" value="VLESS_REALITY"></div><div><label>Порт</label><input type="number" min="1" max="65535" name="inbound_port" value="2053"></div><div><label>Домен</label><input name="inbound_domain" placeholder="node.example.com" required></div></div><button>Сгенерировать inbound</button></form>{inbound}</section>
-<section class="card full"><div class="label">Live console</div><h2>Логи без обновления страницы</h2><div class="logbar"><div class="tabs"><button type="button" class="secondary active" data-stream="container">Docker logs</button><button type="button" class="secondary" data-stream="xray">Xray · xlogs</button><button type="button" class="secondary" id="clear-log">Очистить экран</button></div><span id="stream-state" class="stream-state">подключение…</span></div><div id="live-log" class="terminal">Подключаю поток логов…</div></section>
-</main><footer>Node Forge backend: {html.escape(BIND)}:{PORT} · public route: {html.escape(BASE_PATH)}/ · <a class="muted" href="{web_path('logout')}">Выйти</a></footer></div><script>
-function copyInbound(){{navigator.clipboard.writeText(document.getElementById('inbound').innerText)}}
-const base={json.dumps(BASE_PATH)};
-const composeEditor=document.getElementById('compose-editor');if(composeEditor){{const saved=sessionStorage.getItem('node-forge-compose-draft');if(!composeEditor.value&&saved)composeEditor.value=saved;composeEditor.addEventListener('input',()=>sessionStorage.setItem('node-forge-compose-draft',composeEditor.value));}}
-const installForm=document.getElementById('install-form');installForm.addEventListener('submit',async(e)=>{{e.preventDefault();const button=document.getElementById('install-button');button.disabled=true;try{{const body=new URLSearchParams(new FormData(installForm));const response=await fetch(installForm.action,{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'}},body}});const data=await response.json();if(!response.ok)throw new Error(data.error||'Не удалось начать установку');renderStatus(data.status||data);}}catch(error){{document.getElementById('install-message').textContent=error.message;}}finally{{button.disabled=false;}}}});
-function escapeHtml(value){{const node=document.createElement('span');node.textContent=value;return node.innerHTML;}}
-function renderStatus(data){{if(!data)return;document.getElementById('node-state').textContent=data.state;document.getElementById('node-image').textContent=data.image;document.getElementById('node-restarts').textContent=data.restarts;document.getElementById('step-compose').textContent=data.composeSaved?'готов':'не сохранён';document.getElementById('step-runtime').textContent=data.state;const job=data.job||data;document.getElementById('step-image').textContent=job.tag||'latest';document.getElementById('step-deploy').textContent=job.phase||'idle';document.getElementById('install-message').innerHTML=['queued','pulling','starting','verifying'].includes(job.phase)?'<span class="spinner"></span>'+escapeHtml(job.message||''):escapeHtml(job.message||'');const log=document.getElementById('install-log');if(job.log!==undefined&&log.textContent!==job.log){{const bottom=log.scrollHeight-log.scrollTop-log.clientHeight<50;log.textContent=job.log||'Ожидание запуска…';if(bottom)log.scrollTop=log.scrollHeight;}}}}
-async function pollStatus(){{try{{const response=await fetch(base+'/api/status',{{cache:'no-store'}});if(response.ok)renderStatus(await response.json());}}catch(_error){{}}}}setInterval(pollStatus,1500);pollStatus();
-let stream=null;const live=document.getElementById('live-log');const streamState=document.getElementById('stream-state');function appendLine(line){{const bottom=live.scrollHeight-live.scrollTop-live.clientHeight<60;live.textContent+=(live.textContent?'\\n':'')+line;const lines=live.textContent.split('\\n');if(lines.length>600)live.textContent=lines.slice(-500).join('\\n');if(bottom)live.scrollTop=live.scrollHeight;}}
-function openStream(name){{if(stream)stream.close();live.textContent='';streamState.textContent='подключение…';streamState.className='stream-state';document.querySelectorAll('[data-stream]').forEach(b=>b.classList.toggle('active',b.dataset.stream===name));stream=new EventSource(base+'/stream?source='+encodeURIComponent(name));stream.addEventListener('ready',()=>{{streamState.textContent='● в реальном времени';streamState.className='stream-state live';}});stream.addEventListener('line',event=>{{try{{appendLine(JSON.parse(event.data));}}catch(_error){{appendLine(event.data);}}}});stream.addEventListener('terminal',event=>{{try{{appendLine(JSON.parse(event.data));}}catch(_error){{}}streamState.textContent='поток остановлен';streamState.className='stream-state';stream.close();}});stream.onerror=()=>{{streamState.textContent='переподключение…';streamState.className='stream-state';}};}}
-document.querySelectorAll('[data-stream]').forEach(button=>button.addEventListener('click',()=>openStream(button.dataset.stream)));document.getElementById('clear-log').addEventListener('click',()=>{{live.textContent='';}});openStream('container');
-</script></html>'''
+        ssh_finalize = f'''<section class="card" style="border-color:color-mix(in srgb,var(--warn) 45%,transparent)">{card_head("Этап 2 из 2", f"Оставить только порт {e(str(ssh_port_value))}", "Сейчас старый и новый порты работают одновременно.")}
+{notice(f"<b>Сначала откройте вторую SSH-сессию на порту {e(str(ssh_port_value))}</b> и убедитесь, что вход работает. Только после этого подтверждайте.", "warn", "alert")}
+<form class="js-form" method="post" action="{web_path('ssh-finalize')}" data-confirm="Оставить только SSH-порт {e(str(ssh_port_value))}? Старые порты будут закрыты." data-danger="1">{hidden}
+<div class="cols" style="align-items:end;margin-top:16px"><label class="field"><span>Введите новый порт для подтверждения</span><input name="confirm_port" inputmode="numeric" placeholder="{e(str(ssh_port_value))}" required class="mono-in"></label>
+<div class="field"><button class="btn danger" type="submit" style="width:100%">Закрыть старые порты</button></div></div></form></section>'''
+    ssh_rollback = (
+        f'<form class="js-form" method="post" action="{web_path("ssh-rollback")}" data-confirm="Вернуть настройки SSH из резервной копии, сделанной перед подготовкой?" data-danger="1">{hidden}'
+        f'<button class="btn ghost" type="submit">{icon("restart")}Откатить SSH</button></form>'
+        if ssh["backup"] else ""
+    )
+    phase_names = {"unmanaged": "не менялся", "staged": "ждёт подтверждения", "finalized": "применён", "rolled_back": "откачен"}
+    ssh_view = f'''
+<div class="grid">
+{stat_card("ssh", "Порты сейчас", e(ssh_ports), "sshd и ssh.socket", "mono")}
+{stat_card("shield", "Вход root по паролю", f'<span class="{"warn-t" if ssh_password_on else "ok-t"}">{"разрешён" if ssh_password_on else "выключен"}</span>', "PasswordAuthentication")}
+{stat_card("ssh", "Ключей root", str(ssh["key_count"]), "authorized_keys")}
+{stat_card("refresh", "Этап", e(phase_names.get(ssh["phase"], ssh["phase"])), "двухэтапная смена")}
+</div>
+{ssh_finalize}
+<div class="grid">
+<section class="card span-7">{card_head("Этап 1 из 2", "Подготовить SSH", "Новый порт поднимается параллельно текущему. Старый закрывается только после отдельного подтверждения.")}
+<form class="js-form" method="post" action="{web_path('ssh')}">{hidden}
+<div class="cols"><label class="field"><span>Новый SSH-порт</span><input type="number" min="1" max="65535" name="ssh_port" value="{e(str(ssh_port_value))}" required class="mono-in"></label></div>
+<label class="field"><span>Публичный OpenSSH-ключ root</span><textarea class="short" name="public_key" spellcheck="false" placeholder="ssh-ed25519 AAAAC3... comment"></textarea><p class="hint">Только публичная часть ключа. Существующие ключи не заменяются.</p></label>
+<label class="check"><input type="checkbox" name="password_auth" value="1"{" checked" if ssh_password_on else ""}><span>Разрешить root вход по паролю<small>Если снять флажок, останется только вход по ключу — нужен хотя бы один ключ.</small></span></label>
+<div class="actions"><button class="btn" type="submit">{icon("shield")}Подготовить безопасно</button></div></form>
+{ssh_rollback and f'<div class="actions">{ssh_rollback}</div>'}</section>
+<section class="card span-5">{card_head("authorized_keys", "Ключи root", "Отпечатки ключей, которые принимает OpenSSH.")}<div style="display:grid;gap:8px">{fingerprints}</div>
+{notice("Перед каждым шагом создаётся резервная копия конфигурации SSH. Откат возвращает состояние до подготовки.")}</section>
+</div>'''
+
+    # ---- meltun ----
+    meltun_state = (
+        '<span class="pill ok"><span class="dot ok"></span>передаёт логи</span>' if forwarder_active
+        else '<span class="pill warn">служба остановлена</span>' if forwarder_config
+        else '<span class="pill">не подключён</span>'
+    )
+    https_links = "".join(
+        f'<a class="pill" href="https://{e(site["domain"])}{web_path()}">https://{e(site["domain"])}{web_path()}</a>'
+        for site in public_sites
+    )
+    meltun = f'''
+<div class="grid">
+<section class="card span-7">{card_head("Access log", "Передавать подключения в MelTun", "Нода сама обменяет одноразовый код на рабочий ключ по исходящему HTTPS. Домен и сертификат ей не нужны.", meltun_state)}
+<form class="js-form" method="post" action="{web_path('access-forwarder')}">{hidden}<input type="hidden" name="endpoint" value="https://meltun.org/api/admin/node-logs/ingest">
+<div class="cols"><label class="field"><span>ID ноды — как при выдаче кода</span><input name="node_id" value="{e(forwarder_config.get('node_id', ''))}" placeholder="GERMANY" required class="mono-in" autocomplete="off"></label>
+<label class="field"><span>Часовой пояс логов Xray</span><select name="log_timezone"><option value="UTC"{" selected" if forwarder_config.get("log_timezone", "UTC") == "UTC" else ""}>UTC</option><option value="Europe/Moscow"{" selected" if forwarder_config.get("log_timezone") == "Europe/Moscow" else ""}>Europe/Moscow</option></select></label></div>
+<label class="field"><span>Одноразовый код из MelTun</span><input name="pair_code" type="password" autocomplete="off" placeholder="Код действует 10 минут" required class="mono-in"></label>
+<div class="actions"><button class="btn" type="submit">{icon("meltun")}Подключить ноду</button></div></form>
+{f'<div class="pills" style="margin-top:16px">{https_links}</div>' if https_links else ''}</section>
+<section class="card span-5">{card_head("Порядок", "Как подключить")}
+<ol class="steps">
+<li><a href="#meltun"><span class="n">1</span><span><b>Получите код</b><small>MelTun → Ноды → Сбор логов Xray: ID и публичный IP ноды.</small></span></a></li>
+<li><a href="#install"><span class="n">2</span><span><b>Пересохраните Compose</b><small>Добавится монтирование /var/log/remnanode — затем переустановите контейнер.</small></span></a></li>
+<li><a href="#meltun"><span class="n">3</span><span><b>Включите access log</b><small>В профиле Xray: log.access = /var/log/remnanode/access.log</small></span></a></li>
+</ol>
+<div class="code-wrap" style="margin-top:14px"><button class="btn small ghost" type="button" data-copy-target="log-json">{icon("copy")}<span data-label>Копировать</span></button>
+<pre class="term" id="log-json">"log": {{
+  "access": "/var/log/remnanode/access.log",
+  "error": "/var/log/remnanode/error.log",
+  "loglevel": "warning"
+}}</pre></div></section>
+</div>'''
+
+    # ---- logs ----
+    logs = f'''
+<section class="card"><div class="toolbar"><div class="segmented" role="tablist">
+<button type="button" class="active" data-stream="container">Docker logs</button><button type="button" data-stream="xray">Xray · xlogs</button></div>
+<div class="tool-row" style="align-items:center"><span class="live"><span id="live-dot" class="dot"></span><span id="live-text">ожидание</span></span>
+<button type="button" class="btn small ghost" data-clear-log>{icon("trash")}Очистить</button></div></div>
+<div id="live-log" class="term tall">Откройте вкладку, чтобы подключить поток логов.</div></section>'''
+
+    views = [
+        ("overview", "Обзор", "Состояние ноды", "overview", overview),
+        ("install", "Установка", "Compose и версия RemnaNode", "install", install),
+        ("tls", "Сертификаты", "TLS, домены и порт 443", "tls", certificates),
+        ("inbound", "Inbound", "Генератор профилей Xray", "inbound", inbound),
+        ("network", "Сеть", "Тюнинг ядра", "network", network),
+        ("ssh", "SSH", "Ключ, порт и пароль", "ssh", ssh_view),
+        ("meltun", "MelTun", "История подключений", "meltun", meltun),
+        ("logs", "Логи", "Потоки в реальном времени", "logs", logs),
+    ]
+    badges = {
+        "install": "ok" if state == "running" else "warn",
+        "ssh": "warn" if ssh["phase"] == "staged" else "",
+    }
+    badge_html = '<i class="badge"></i>'
+    nav = "".join(
+        f'<a href="#{key}" data-view="{key}">{icon(icon_name)}<span>{title}</span>'
+        f'{badge_html if badges.get(key) == "warn" else ""}</a>'
+        for key, title, _crumb, icon_name, _body in views
+    )
+    sections = "".join(
+        f'<section class="view" id="view-{key}" data-title="{title}" data-crumb="{crumb}"{"" if key == "logs" else " data-refresh"}>{body}</section>'
+        for key, title, crumb, _icon, body in views
+    )
+    body = f'''<div class="app">
+<aside class="side"><a class="brand" href="#overview">{LOGO}<div><b>Node Forge</b><small>Meltun · нода</small></div></a>
+<nav class="nav" id="nav" aria-label="Разделы">{nav}</nav>
+<div class="side-foot"><div class="ip" id="side-ip"><span class="dot {state_cls}"></span>{e(s["public_ip"])}</div>
+<div class="tool-row"><button class="icon-btn" type="button" data-theme-toggle title="Сменить тему">{icon("moon")}Тема</button>
+<a class="icon-btn" href="{web_path('logout')}" title="Выйти">{icon("logout")}Выйти</a></div></div></aside>
+<div class="content"><header class="topbar"><div><div class="crumb" id="view-crumb">Состояние ноды</div><h1 id="view-title">Обзор</h1></div>
+<div class="top-tools"><span class="chip"><span id="chip-dot" class="dot {state_cls}"></span><span class="long">remnanode ·</span><span id="chip-text">{e(state_label)}</span></span>
+<button class="icon-btn mobile-only" type="button" data-theme-toggle title="Сменить тему" style="flex:none;width:34px">{icon("moon")}</button>
+<a class="icon-btn mobile-only" href="{web_path('logout')}" title="Выйти" style="flex:none;width:34px">{icon("logout")}</a></div></header>
+<main>{sections}</main>
+<footer class="foot">Node Forge · backend {e(BIND)}:{PORT} · маршрут {e(BASE_PATH)}/</footer></div></div>
+<div id="toasts" aria-live="polite"></div>
+<dialog id="confirm"><form method="dialog" class="dlg"><div class="dlg-icon">{icon("alert")}</div><h3>Подтвердите действие</h3><p id="confirm-text"></p>
+<div class="actions"><button class="btn ghost" value="cancel" id="confirm-cancel">Отмена</button><button class="btn" value="ok" id="confirm-ok">Продолжить</button></div></form></dialog>'''
+    boot = {
+        "base": BASE_PATH, "stateLabels": STATE_LABELS, "phaseLabels": PHASE_LABELS,
+        "status": runtime, "flash": {"ok": message, "error": error},
+    }
+    return render_page("Node Forge", body, boot, APP_JS)
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "NodeForge/1.0"
+    server_version = "NodeForge/2.0"
     protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt, *args):
-        print(f"{self.address_string()} {fmt % args}", flush=True)
+        print(f"{self.client_ip()} {fmt % args}", flush=True)
+
     def send_html(self, body, code=200, headers=None):
         payload = body.encode()
         self.send_response(code)
@@ -1418,9 +2547,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", CSP)
         if headers:
-            for k, v in headers.items(): self.send_header(k, v)
-        self.end_headers(); self.wfile.write(payload)
+            for key, value in headers.items():
+                self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(payload)
+
     def send_json(self, body, code=200):
         payload = json.dumps(body, ensure_ascii=False).encode()
         self.send_response(code)
@@ -1428,14 +2561,40 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers(); self.wfile.write(payload)
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def client_ip(self):
+        ip = self.client_address[0]
+        # Nginx is the only local reverse proxy; it overwrites X-Real-IP.
+        if ip in ("127.0.0.1", "::1"):
+            forwarded = normalize_ip(self.headers.get("X-Real-IP", ""))
+            if forwarded:
+                return forwarded
+        return ip
+
+    def is_https(self):
+        return self.headers.get("X-Forwarded-Proto") == "https"
+
+    def session(self):
+        jar = cookies.SimpleCookie()
+        try:
+            jar.load(self.headers.get("Cookie", ""))
+        except cookies.CookieError:
+            return None, None
+        token = jar["rnm_session"].value if "rnm_session" in jar else ""
+        return token, get_session(token)
+
+    def wants_json(self):
+        return "application/json" in self.headers.get("Accept", "")
+
     def stream_logs(self, source):
         commands = {
-            "container": ["docker", "logs", "--follow", "--tail", "120", "--timestamps", "remnanode"],
+            "container": ["docker", "logs", "--follow", "--tail", "150", "--timestamps", "remnanode"],
             "xray": ["docker", "exec", "remnanode", "xlogs"],
         }
         if source not in commands:
-            return self.send_json({"error": "Unknown log source."}, 400)
+            return self.send_json({"error": "Неизвестный источник логов."}, 400)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache, no-store")
@@ -1449,8 +2608,8 @@ class Handler(BaseHTTPRequestHandler):
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ)
         try:
-            ready = f"event: ready\ndata: {json.dumps(source)}\n\n".encode()
-            self.wfile.write(ready); self.wfile.flush()
+            self.wfile.write(f"event: ready\ndata: {json.dumps(source)}\n\n".encode())
+            self.wfile.flush()
             while True:
                 events = selector.select(timeout=10)
                 if events:
@@ -1465,9 +2624,10 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     if process.poll() is not None:
                         break
-                    self.wfile.write(b": keepalive\n\n"); self.wfile.flush()
-            message = f"Log command stopped with exit code {process.poll()}."
-            self.wfile.write(f"event: terminal\ndata: {json.dumps(message)}\n\n".encode())
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+            message = f"Команда логов завершилась с кодом {process.poll()}."
+            self.wfile.write(f"event: terminal\ndata: {json.dumps(message, ensure_ascii=False)}\n\n".encode())
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
@@ -1475,83 +2635,130 @@ class Handler(BaseHTTPRequestHandler):
             selector.close()
             if process.poll() is None:
                 process.terminate()
-                try: process.wait(timeout=3)
-                except subprocess.TimeoutExpired: process.kill()
-    def authed(self):
-        jar = cookies.SimpleCookie(self.headers.get("Cookie", ""))
-        return "rnm_session" in jar and hmac.compare_digest(jar["rnm_session"].value, session_token())
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+
     def routed(self):
         path, _, query = self.path.partition("?")
-        if path == BASE_PATH: return "/", query
-        if not path.startswith(BASE_PATH + "/"): return None, query
+        if path == BASE_PATH:
+            return "/", query
+        if not path.startswith(BASE_PATH + "/"):
+            return None, query
         return path[len(BASE_PATH):] or "/", query
+
     def form(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        if length > 1_000_000: raise ValueError("Request is too large.")
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length > 1_000_000:
+            raise ValueError("Слишком большой запрос.")
         return urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "replace"), keep_blank_values=True)
+
     def redirect(self, message="", error=""):
-        query = urllib.parse.urlencode({"ok": message, "error": error})
-        self.send_response(303); self.send_header("Location", web_path() + "?" + query)
-        self.send_header("Content-Length", "0"); self.end_headers()
+        query = urllib.parse.urlencode({key: value for key, value in (("ok", message), ("error", error)) if value})
+        self.send_response(303)
+        self.send_header("Location", web_path() + ("?" + query if query else ""))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def respond(self, message="", error="", status=None):
+        if self.wants_json():
+            if error:
+                return self.send_json({"error": error}, 400)
+            payload = {"ok": True, "message": message}
+            if status is not None:
+                payload["status"] = status
+            return self.send_json(payload)
+        return self.redirect(message=message, error=error)
+
+    def session_cookie(self, token, max_age):
+        secure = "; Secure" if self.is_https() else ""
+        return f"rnm_session={token}; Max-Age={max_age}; HttpOnly; SameSite=Strict; Path={web_path()}{secure}"
+
     def do_GET(self):
         path, query = self.routed()
-        if path is None: return self.send_html("Not found", 404)
+        if path is None:
+            return self.send_html("Not found", 404)
+        token, session = self.session()
         if path == "/logout":
-            return self.send_html(render_login(), headers={"Set-Cookie": f"rnm_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path={web_path()}"})
-        if not self.authed(): return self.send_html(render_login(), 401)
+            drop_session(token)
+            return self.send_html(render_login(), headers={"Set-Cookie": self.session_cookie("", 0)})
+        if not session:
+            if path.startswith("/api/") or path == "/stream":
+                return self.send_json({"error": "Требуется вход."}, 401)
+            return self.send_html(render_login(), 401)
         args = urllib.parse.parse_qs(query)
-        if path == "/api/status": return self.send_json(runtime_status())
-        if path == "/stream": return self.stream_logs(args.get("source", ["container"])[0])
-        if path != "/": return self.send_html("Not found", 404)
-        return self.send_html(render_dashboard(args.get("ok", [""])[0], args.get("error", [""])[0]))
+        if path == "/api/status":
+            return self.send_json(runtime_status())
+        if path == "/stream":
+            return self.stream_logs(args.get("source", ["container"])[0])
+        if path != "/":
+            return self.send_html("Not found", 404)
+        return self.send_html(render_dashboard(session["csrf"], args.get("ok", [""])[0], args.get("error", [""])[0]))
+
     def do_POST(self):
         path, _ = self.routed()
-        if path is None: return self.send_html("Not found", 404)
-        try: form = self.form()
-        except Exception as exc: return self.send_html(render_login(str(exc)), 400)
+        if path is None:
+            return self.send_html("Not found", 404)
+        try:
+            form = self.form()
+        except Exception as exc:
+            return self.send_html(render_login(str(exc)), 400)
         if path == "/login":
-            ip = self.client_address[0]; now = time.time(); record = attempts.get(ip, [])
-            record = [x for x in record if now - x < 60]; attempts[ip] = record
-            if len(record) >= 5: return self.send_html(render_login("Too many attempts. Wait one minute."), 429)
-            if hmac.compare_digest(form.get("password", [""])[0], ADMIN_PASSWORD):
-                attempts.pop(ip, None)
-                self.send_response(303); self.send_header("Location", web_path())
-                secure_cookie = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
-                self.send_header("Set-Cookie", f"rnm_session={session_token()}; HttpOnly; SameSite=Strict; Path={web_path()}{secure_cookie}")
+            ip = self.client_ip()
+            if not login_allowed(ip):
+                return self.send_html(render_login("Слишком много попыток. Подождите минуту."), 429)
+            if hmac.compare_digest(form.get("password", [""])[0].encode(), ADMIN_PASSWORD.encode()):
+                reset_login_failures(ip)
+                self.send_response(303)
+                self.send_header("Location", web_path())
+                self.send_header("Set-Cookie", self.session_cookie(create_session(), SESSION_TTL))
                 self.send_header("Content-Length", "0")
                 return self.end_headers()
-            record.append(now); return self.send_html(render_login("Wrong password."), 401)
-        is_api = path.startswith("/api/")
-        if not self.authed():
-            return self.send_json({"error": "Authentication required."}, 401) if is_api else self.send_html(render_login(), 401)
-        if not hmac.compare_digest(form.get("csrf", [""])[0], csrf_token()):
-            return self.send_json({"error": "CSRF validation failed."}, 403) if is_api else self.redirect(error="CSRF validation failed.")
-        if path == "/access-forwarder" and form.get("token", [""])[0].strip() and not (self.headers.get("X-Forwarded-Proto") == "https" or (self.client_address[0] in ("127.0.0.1", "::1") and "X-Forwarded-For" not in self.headers)):
-            return self.redirect(error="Open Node Forge over HTTPS or an SSH tunnel before sending a reusable node token. A one-time pairing code can be used here over HTTP.")
+            record_login_failure(ip)
+            return self.send_html(render_login("Неверный пароль."), 401)
+        token, session = self.session()
+        if not session:
+            if self.wants_json() or path.startswith("/api/"):
+                return self.send_json({"error": "Сессия истекла — войдите заново."}, 401)
+            return self.send_html(render_login(), 401)
+        if not hmac.compare_digest(form.get("csrf", [""])[0].encode(), session["csrf"].encode()):
+            return self.respond(error="Проверка CSRF не пройдена. Обновите страницу.")
+        if path == "/access-forwarder" and form.get("token", [""])[0].strip() and not (
+            self.is_https() or (self.client_address[0] in ("127.0.0.1", "::1") and "X-Forwarded-For" not in self.headers)
+        ):
+            return self.respond(error="Постоянный токен ноды можно передавать только по HTTPS или через SSH-туннель. Одноразовый код подключения можно вводить и по HTTP.")
+        handlers = {
+            "/compose": apply_compose,
+            "/access-forwarder": configure_access_forwarder,
+            "/cert": issue_certificate,
+            "/public-https": toggle_public_https,
+            "/network": apply_network,
+            "/ssh": apply_ssh_access,
+            "/ssh-finalize": finalize_ssh_access,
+            "/ssh-rollback": lambda _form: rollback_ssh_access(),
+            "/inbound": generate_inbound,
+            "/action": node_action,
+        }
         try:
-            if path == "/compose": message = apply_compose(form)
-            elif path == "/access-forwarder": message = configure_access_forwarder(form)
-            elif path == "/cert": message = issue_certificate(form)
-            elif path == "/network": message = apply_network(form)
-            elif path == "/ssh": message = apply_ssh_access(form)
-            elif path == "/ssh-finalize": message = finalize_ssh_access(form)
-            elif path == "/ssh-rollback": message = rollback_ssh_access()
-            elif path == "/inbound": message = generate_inbound(form)
-            elif path == "/action": message = node_action(form)
-            elif path == "/api/install":
+            if path == "/api/install":
                 start_install(form)
-                return self.send_json({"ok": True, "status": runtime_status()})
-            else: raise ValueError("Unknown action.")
-            self.redirect(message=message)
+                return self.respond(message="Установка запущена. Ход виден ниже.", status=runtime_status())
+            handler = handlers.get(path)
+            if not handler:
+                raise ValueError("Неизвестное действие.")
+            return self.respond(message=handler(form))
         except Exception as exc:
-            if is_api: return self.send_json({"error": str(exc)[-4000:]}, 400)
-            self.redirect(error=str(exc)[-4000:])
+            return self.respond(error=str(exc)[-4000:])
 
 
 if __name__ == "__main__":
     network_baseline()
     load_install_state()
-    ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
+    threading.Thread(target=warm_caches, daemon=True, name="warm-caches").start()
+    server = ThreadingHTTPServer((BIND, PORT), Handler)
+    server.daemon_threads = True
+    server.serve_forever()
 PY
 chmod 0750 /opt/remnanode-manager/app.py
 
