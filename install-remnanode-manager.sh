@@ -32,6 +32,87 @@ install -d -m 0755 /var/www/remnanode-decoy
 install -d -m 0755 /var/lib/remnawave/configs/xray/ssl
 install -d -m 0755 /var/log/remnanode
 
+# Recommended network settings for a VPN node. They match the panel's network
+# switches (BBR+fq, Fast Open, MTU probing, 16 MiB buffers, 8192 queues), so the
+# switches show as enabled. Install-time values are saved first, so unchecking a
+# switch still restores the original system value. Runs once per server; set
+# RNM_SKIP_NETWORK_TUNING=1 to skip it.
+tune_network() {
+  local state=/var/lib/remnanode-manager
+  local marker=$state/network-tuned
+  if [[ ${RNM_SKIP_NETWORK_TUNING:-0} == 1 || -e $marker ]]; then
+    echo "Network tuning: skipped (already applied or disabled)."
+    return 0
+  fi
+  if [[ ! -e $state/network-baseline.json ]]; then
+    python3 - "$state/network-baseline.json" <<'BASELINE'
+import json
+import subprocess
+import sys
+
+keys = [
+    "net.core.default_qdisc", "net.ipv4.tcp_congestion_control",
+    "net.ipv4.tcp_fastopen", "net.ipv4.tcp_mtu_probing",
+    "net.core.rmem_max", "net.core.wmem_max", "net.core.netdev_max_backlog",
+    "net.core.somaxconn", "net.ipv4.tcp_rmem", "net.ipv4.tcp_wmem",
+]
+values = {key: subprocess.run(["sysctl", "-n", key], capture_output=True, text=True).stdout.strip() for key in keys}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(values, indent=2) + "\n")
+BASELINE
+    chmod 0600 "$state/network-baseline.json"
+  fi
+  modprobe tcp_bbr 2>/dev/null || true
+  modprobe nf_conntrack 2>/dev/null || true
+  printf 'tcp_bbr\nnf_conntrack\n' > /etc/modules-load.d/remnanode-network.conf
+  cat > /etc/sysctl.d/99-remnanode-manager-network.conf <<'SYSCTL'
+# Managed by RemnaNode Node Forge. Unchecked controls restore install-time values.
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_mtu_probing=1
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.ipv4.tcp_rmem=4096 131072 16777216
+net.ipv4.tcp_wmem=4096 65536 16777216
+net.core.netdev_max_backlog=8192
+net.core.somaxconn=8192
+SYSCTL
+  echo "# Compatibility marker; settings are stored in 99-remnanode-manager-network.conf." > /etc/sysctl.d/99-vpn-bbr.conf
+  cat > /etc/sysctl.d/98-remnanode-extra-network.conf <<'SYSCTL'
+# Node Forge: VPN-friendly TCP settings outside the panel switches.
+net.ipv4.tcp_max_syn_backlog=8192
+net.ipv4.tcp_fin_timeout=20
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_keepalive_time=600
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=5
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_notsent_lowat=131072
+net.ipv4.ip_local_port_range=10240 65535
+net.netfilter.nf_conntrack_max=262144
+vm.swappiness=10
+SYSCTL
+  sysctl --system >/dev/null 2>&1 || true
+  local dev
+  dev=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+  if [[ -n $dev ]]; then
+    tc qdisc replace dev "$dev" root fq 2>/dev/null || true
+  fi
+  local mem_kb
+  mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+  if [[ -z $(swapon --show --noheadings 2>/dev/null) && ! -e /swapfile && ${mem_kb:-0} -lt 4194304 ]]; then
+    if fallocate -l 1G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none; then
+      chmod 0600 /swapfile
+      mkswap /swapfile >/dev/null && swapon /swapfile
+      grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
+  fi
+  date -u +%FT%TZ > "$marker"
+  echo "Network tuning: $(sysctl -n net.ipv4.tcp_congestion_control)/$(sysctl -n net.core.default_qdisc), buffers $(sysctl -n net.core.rmem_max), swap $(swapon --show --noheadings | awk '{print $3}' | head -1)"
+}
+tune_network
+
 cat > /opt/remnanode-manager/app.py <<'PY'
 #!/usr/bin/env python3
 import calendar

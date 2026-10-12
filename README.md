@@ -54,6 +54,24 @@ Password: generated-password
 - передавать Xray access log в MelTun для истории подключений по пользователям;
 - создавать резервные копии Compose, Nginx и sysctl перед изменениями.
 
+## Сеть при установке
+
+Установщик сразу настраивает сеть под VPN-ноду: BBR + fq, TCP Fast Open,
+MTU probing, буферы 16 MiB и очереди 8192 (это те же значения, что включают
+переключатели «Сеть» в панели), а также keepalive 10 минут, FIN-таймаут 20 с,
+отключённое замедление после простоя и `notsent_lowat`. Если RAM меньше 4 ГБ и
+свопа нет, создаётся `/swapfile` на 1 ГБ.
+
+Перед изменением исходные значения сохраняются в
+`/var/lib/remnanode-manager/network-baseline.json`, поэтому снятый переключатель
+в панели по-прежнему возвращает то, что было до установки. Настройка выполняется
+один раз (маркер `/var/lib/remnanode-manager/network-tuned`) и при переустановке
+не перетирает изменения, сделанные в панели. Чтобы пропустить шаг:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/usupix/remnanode-node-forge/main/install-remnanode-manager.sh | sudo RNM_SKIP_NETWORK_TUNING=1 bash
+```
+
 ## Интерфейс
 
 Панель разбита на разделы: «Обзор», «Установка», «Сертификаты», «Inbound»,
