@@ -282,6 +282,34 @@ def resolve_domain_addresses(domain):
     return sorted(addresses, key=lambda value: (ipaddress.ip_address(value).version, int(ipaddress.ip_address(value))))
 
 
+PUBLIC_DOH = (
+    "https://cloudflare-dns.com/dns-query",
+    "https://dns.google/resolve",
+)
+
+
+def resolve_public_addresses(domain, timeout=5):
+    """A/AAAA via public DNS-over-HTTPS; bypasses a stale provider resolver cache."""
+    addresses = set()
+    for endpoint in PUBLIC_DOH:
+        for record_type, code in (("A", 1), ("AAAA", 28)):
+            query = urllib.parse.urlencode({"name": domain, "type": record_type})
+            request = urllib.request.Request(f"{endpoint}?{query}", headers={"Accept": "application/dns-json"})
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    payload = json.load(response)
+            except Exception:
+                continue
+            for answer in payload.get("Answer") or []:
+                if answer.get("type") == code:
+                    value = normalize_ip(answer.get("data", ""))
+                    if value:
+                        addresses.add(value)
+        if addresses:
+            break
+    return sorted(addresses, key=lambda value: (ipaddress.ip_address(value).version, int(ipaddress.ip_address(value))))
+
+
 def atomic_write(path: Path, data: str, mode=0o600):
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(path.name + ".tmp")
@@ -1252,9 +1280,18 @@ def issue_certificate(form):
         raise ValueError("Выбранного IP больше нет на сервере. Обновите страницу и выберите снова.")
     addresses = resolve_domain_addresses(domain)
     dns_forced = form.get("force_dns") == ["1"]
-    if selected_ip not in addresses and not dns_forced:
-        resolved = ", ".join(addresses) or "пустоту"
-        raise ValueError(f"DNS {domain} указывает на {resolved}, а выбран IP сервера {selected_ip}.")
+    stale_local_dns = False
+    if selected_ip not in addresses:
+        public = resolve_public_addresses(domain)
+        if selected_ip in public:
+            # The server's resolver still caches the old record; Let's Encrypt
+            # checks through public DNS, which already has the new address.
+            stale_local_dns = True
+            addresses = public
+        elif not dns_forced:
+            resolved = ", ".join(addresses) or "пустоту"
+            public_note = f" Публичный DNS: {', '.join(public)}." if public and public != addresses else ""
+            raise ValueError(f"DNS {domain} указывает на {resolved}, а выбран IP сервера {selected_ip}.{public_note}")
     create_decoy_site(domain)
     available = Path("/etc/nginx/sites-available") / f"rnm-{domain}.conf"
     enabled = Path("/etc/nginx/sites-enabled") / available.name
@@ -1295,11 +1332,12 @@ def issue_certificate(form):
     containers = run(["docker", "ps", "-a", "--format", "{{.Names}}"], check=False).splitlines()
     if form.get("restart_node") == ["1"] and "remnanode" in containers:
         run(["docker", "restart", "remnanode"], timeout=120)
-    dns_note = (
-        f" DNS совпадает с выбранным IP {selected_ip}."
-        if selected_ip in addresses else
-        f" Несовпадение DNS с IP {selected_ip} проигнорировано по вашему выбору."
-    )
+    if stale_local_dns:
+        dns_note = f" Публичный DNS уже указывает на {selected_ip}; DNS этого сервера пока отдаёт старую запись из кэша."
+    elif selected_ip in addresses:
+        dns_note = f" DNS совпадает с выбранным IP {selected_ip}."
+    else:
+        dns_note = f" Несовпадение DNS с IP {selected_ip} проигнорировано по вашему выбору."
     if public_https:
         https_note = " Сайт и панель доступны по HTTPS на TCP 443."
     elif requested_public:
