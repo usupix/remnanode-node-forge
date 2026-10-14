@@ -23,6 +23,25 @@ if ! docker compose version >/dev/null 2>&1; then
 fi
 systemctl enable --now docker nginx
 
+# REALITY self-steal hands every handshake and probe to nginx on 127.0.0.1:8443,
+# so Debian's default of 768 worker connections runs out on busy nodes
+# ("worker_connections are not enough") and client connections fail.
+raise_nginx_limits_in() {
+  local conf=$1 current
+  [[ -f $conf ]] || return 0
+  current=$(awk '$1 == "worker_connections" {gsub(";", "", $2); print $2; exit}' "$conf")
+  if [[ -n $current && $current -lt 16384 ]]; then
+    sed -i -E 's/^([[:space:]]*)worker_connections[[:space:]]+[0-9]+;/\1worker_connections 16384;/' "$conf"
+  fi
+  if ! grep -q '^worker_rlimit_nofile' "$conf"; then
+    sed -i -E '0,/^worker_processes[^;]*;/s//&\nworker_rlimit_nofile 65535;/' "$conf"
+  fi
+}
+raise_nginx_limits_in /etc/nginx/nginx.conf
+install -d /etc/systemd/system/nginx.service.d
+printf '[Service]\nLimitNOFILE=65535\n' > /etc/systemd/system/nginx.service.d/limits.conf
+systemctl daemon-reload
+
 install -d -m 0750 /opt/remnanode-manager
 install -d -m 0750 /opt/remnanode
 install -d -m 0700 /var/lib/remnanode-manager/backups /var/lib/remnanode-manager/generated
