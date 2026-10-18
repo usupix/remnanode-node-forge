@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#f7f9fc">
+  <meta name="description" content="Текущее состояние и история доступности серверов MelTun.">
+  <title>Статус серверов — MelTun</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="/app.js"></script>
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <a class="brand" href="/" aria-label="MelTun — статус серверов"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>MelTun<span class="brand-divider">/</span><span class="brand-caption">статус</span></a>
+    <span class="live"><span class="live-dot"></span>Обновляется автоматически</span>
+  </header>
+  <main>
+    <section class="overview" aria-labelledby="headline">
+      <p class="eyebrow">Состояние сети</p>
+      <div class="headline-row"><span id="overall-dot" class="status-orbit unknown" aria-hidden="true"></span><h1 id="headline">Проверяем серверы</h1></div>
+      <p id="summary" class="summary" aria-live="polite">Получаем актуальное состояние сети.</p>
+      <p id="fetch-error" class="fetch-error" hidden>Не удалось обновить данные. Показан последний полученный результат.</p>
+    </section>
+    <section class="servers-section" aria-labelledby="servers-title">
+      <div class="section-head"><h2 id="servers-title">Серверы <span id="node-count" class="count">—</span></h2>
+        <div class="periods" role="group" aria-label="Период истории"><button data-days="7" aria-pressed="false">7 дней</button><button data-days="30" aria-pressed="false">30 дней</button><button data-days="90" aria-pressed="true">90 дней</button></div>
+      </div>
+      <div class="history-caption"><span>История доступности</span><span>Аптайм за период</span></div>
+      <div id="servers" class="servers"><p class="loading">Загружаем состояние…</p></div>
+      <div class="legend"><span><i class="swatch up"></i>Работает</span><span><i class="swatch degraded"></i>Частичный сбой</span><span><i class="swatch down"></i>Недоступен</span><span><i class="swatch unknown"></i>Нет данных</span></div>
+    </section>
+    <section class="incidents-section" aria-labelledby="incidents-title">
+      <div class="section-head"><h2 id="incidents-title">История сбоев</h2><span class="muted">За выбранный период</span></div>
+      <div id="incidents" class="incidents"><p class="empty">История появится после первых проверок.</p></div>
+    </section>
+    <details class="method"><summary>Как мы считаем доступность</summary><p>Раз в минуту главный сервер проверяет подключение ноды к панели и доступность её управляющего порта. Если установлен агент Node Forge, учитывается и состояние ядра Xray. Сбой подтверждается двумя последовательными проверками.</p><p>Аптайм — доля времени без сбоев за выбранный период. Время до начала наблюдения и пропуски проверок не включаются в процент. Эта проверка показывает состояние инфраструктуры; доступность VPN из вашей сети может отличаться.</p><p>Даты и время — по Москве. Время отклика — установление TCP-соединения с главным сервером, а не пинг из приложения.</p></details>
+  </main>
+  <footer><span>MelTun network</span><span id="updated">Ожидаем первую проверку</span></footer>
+</div>
+<div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+</body>
+</html>

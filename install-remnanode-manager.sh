@@ -168,6 +168,7 @@ COMPOSE_FILE = COMPOSE_DIR / "docker-compose.yml"
 SSL_DIR = Path("/var/lib/remnawave/configs/xray/ssl")
 XRAY_LOG_DIR = Path("/var/log/remnanode")
 ACCESS_FORWARDER_CONFIG = Path("/etc/remnanode-access-forwarder.json")
+STATUS_AGENT_CONFIG = Path("/etc/remnanode-status.json")
 SYSCTL_BBR = Path("/etc/sysctl.d/99-vpn-bbr.conf")
 SYSCTL_TUNE = Path("/etc/sysctl.d/99-remnanode-manager-network.conf")
 NETWORK_BASELINE = STATE_DIR / "network-baseline.json"
@@ -1655,6 +1656,44 @@ def rollback_ssh_access():
     return f"Настройки SSH восстановлены из {backup_path}."
 
 
+def configure_status_agent(form):
+    if form.get("action", [""])[0] == "stop":
+        run(["systemctl", "disable", "--now", "remnanode-status.timer"])
+        return "Передача состояния отключена. Настройки сохранены."
+    previous = {}
+    if STATUS_AGENT_CONFIG.exists():
+        previous = json.loads(STATUS_AGENT_CONFIG.read_text())
+    secret = form.get("status_secret", [""])[0].strip()
+    if not secret and COMPOSE_FILE.exists():
+        config = yaml.safe_load(COMPOSE_FILE.read_text()) or {}
+        environment = config.get("services", {}).get("remnanode", {}).get("environment", {})
+        if isinstance(environment, list):
+            environment = dict(item.split("=", 1) for item in environment if isinstance(item, str) and "=" in item)
+        secret = str(environment.get("SECRET_KEY") or "").strip().strip('"').strip("'")
+    secret = secret or previous.get("secret_key", "")
+    if not secret:
+        raise ValueError("Вставьте SECRET_KEY Remnawave или сначала сохраните Compose с SECRET_KEY.")
+    name = form.get("status_name", [""])[0].strip() or socket.gethostname()
+    country = form.get("status_country", [""])[0].strip().upper()
+    if len(name) > 80 or any(ord(char) < 32 for char in name) or not re.fullmatch(r"[A-Z]{2}|", country):
+        raise ValueError("Имя — до 80 символов; страна — двухбуквенный код, например DE.")
+    config = {"secret_key": secret, "name": name, "country": country,
+              "agent_id": previous.get("agent_id") or secrets.token_hex(16)}
+    checked = subprocess.run(["python3", str(APP_DIR / "status_agent.py"), "--validate"],
+                             input=json.dumps(config), text=True, capture_output=True, timeout=15)
+    if checked.returncode:
+        raise ValueError("SECRET_KEY не содержит корректную пару сертификата и ключа Remnawave.")
+    backup([STATUS_AGENT_CONFIG], "status-agent")
+    atomic_write(STATUS_AGENT_CONFIG, json.dumps(config), 0o600)
+    run(["systemctl", "enable", "--now", "remnanode-status.timer"])
+    run(["systemctl", "start", "remnanode-status.service"], timeout=40)
+    state_file = STATE_DIR / "status-agent-state.json"
+    state = json.loads(state_file.read_text()) if state_file.exists() else {}
+    if state.get("last_error"):
+        return "Настройки сохранены. Главный сервер пока не принял пакет (" + str(state["last_error"]) + "). Повторим через минуту."
+    return "Сервер подключён к status.meltun.org. Состояние отправляется раз в минуту."
+
+
 def node_action(form):
     action = form.get("action", [""])[0]
     if action == "restart":
@@ -2615,6 +2654,29 @@ def render_dashboard(csrf, message="", error=""):
 }}</pre></div></section>
 </div>'''
 
+    status_config = {}
+    status_delivery = {}
+    try:
+        if STATUS_AGENT_CONFIG.exists():
+            status_config = json.loads(STATUS_AGENT_CONFIG.read_text())
+        if (STATE_DIR / "status-agent-state.json").exists():
+            status_delivery = json.loads((STATE_DIR / "status-agent-state.json").read_text())
+    except (ValueError, OSError):
+        pass
+    status_active = command_ok(["systemctl", "is-active", "--quiet", "remnanode-status.timer"])
+    last_success = status_delivery.get("last_success")
+    delivery_label = time.strftime("%d.%m.%Y %H:%M:%S UTC", time.gmtime(last_success)) if last_success else "Ещё не отправлялся"
+    status_view = f'''
+<section class="card">{card_head("Доступность", "Статус сервера", "Состояние сервера и ядра Xray на status.meltun.org. Существующий SECRET_KEY Remnawave подтверждает принадлежность ноды твоей панели.", '<span class="pill ok">включено</span>' if status_active else '<span class="pill">выключено</span>')}
+<form class="js-form" method="post" action="{web_path('status-agent')}">{hidden}
+<div class="cols"><label class="field"><span>Имя сервера на статус-сайте</span><input name="status_name" value="{e(status_config.get('name', socket.gethostname()))}" maxlength="80" required></label><label class="field"><span>Код страны</span><input name="status_country" value="{e(status_config.get('country', ''))}" maxlength="2" placeholder="DE" class="mono-in"></label></div>
+<label class="field"><span>SECRET_KEY из Remnawave</span><textarea name="status_secret" rows="4" autocomplete="off" spellcheck="false" class="mono-in" placeholder="Вставь SECRET_KEY из Compose. Если поле пустое — возьмём из сохранённого Compose."></textarea></label>
+<p class="sub">Секрет хранится только на этой ноде. На главный сервер отправляются подписанные данные, а не приватный ключ. Для ввода секретов открывай Node Forge по HTTPS.</p>
+<div class="actions"><button type="submit" class="btn" name="action" value="connect">{icon('meltun')}Подключить к статус-сайту</button><a class="btn ghost" href="https://status.meltun.org/" target="_blank" rel="noopener">Открыть статус-сайт</a></div></form>
+<p class="sub">Последний принятый пакет: {e(delivery_label)}. {e(str(status_delivery.get('last_error') or ''))}</p>
+<form class="js-form" method="post" action="{web_path('status-agent')}">{hidden}<input type="hidden" name="action" value="stop"><div class="actions"><button class="btn ghost" type="submit">Отключить отправку</button></div></form>
+</section>'''
+
     # ---- logs ----
     logs = f'''
 <section class="card"><div class="toolbar"><div class="segmented" role="tablist">
@@ -2631,6 +2693,7 @@ def render_dashboard(csrf, message="", error=""):
         ("network", "Сеть", "Тюнинг ядра", "network", network),
         ("ssh", "SSH", "Ключ, порт и пароль", "ssh", ssh_view),
         ("meltun", "MelTun", "История подключений", "meltun", meltun),
+        ("status", "Статус", "Публичная доступность серверов", "overview", status_view),
         ("logs", "Логи", "Потоки в реальном времени", "logs", logs),
     ]
     badges = {
@@ -2869,6 +2932,7 @@ class Handler(BaseHTTPRequestHandler):
         handlers = {
             "/compose": apply_compose,
             "/access-forwarder": configure_access_forwarder,
+            "/status-agent": configure_status_agent,
             "/cert": issue_certificate,
             "/public-https": toggle_public_https,
             "/network": apply_network,
@@ -3036,6 +3100,147 @@ ReadOnlyPaths=/var/log/remnanode /etc/remnanode-access-forwarder.json
 WantedBy=multi-user.target
 UNIT
 
+cat > /opt/remnanode-manager/status_agent.py <<'STATUS_AGENT'
+"""Send signed status. The Remnawave private key never leaves this machine."""
+import base64
+import json
+import os
+from pathlib import Path
+import secrets
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+CONFIG = Path("/etc/remnanode-status.json")
+STATE = Path("/var/lib/remnanode-manager/status-agent-state.json")
+ENDPOINT = "https://status.meltun.org/api/agent/heartbeat"
+
+
+def decode_secret(secret):
+    secret = secret.strip()
+    if secret.startswith("SECRET_KEY="):
+        secret = secret.split("=", 1)[1]
+    secret = secret.strip().strip('"').strip("'")
+    if not secret or len(secret) > 20000:
+        raise ValueError("Invalid SECRET_KEY")
+    data = json.loads(base64.b64decode(secret, validate=True))
+    cert, key = data["nodeCertPem"], data["nodeKeyPem"]
+    if not isinstance(cert, str) or not isinstance(key, str) or "BEGIN CERTIFICATE" not in cert or "BEGIN PRIVATE KEY" not in key:
+        raise ValueError("Invalid certificate/key")
+    return cert, key
+
+
+def proof(config, core_running, now=None):
+    cert, private_key = decode_secret(config["secret_key"])
+    payload = {"agent_id": config["agent_id"], "timestamp": int(time.time() if now is None else now),
+               "nonce": secrets.token_hex(16), "core_running": bool(core_running),
+               "name": config["name"], "country": config.get("country", "")}
+    message = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    with tempfile.TemporaryDirectory(prefix="node-status-") as temp:
+        keyfile, certfile = Path(temp) / "key.pem", Path(temp) / "cert.pem"
+        keyfile.write_text(private_key)
+        keyfile.chmod(0o600)
+        certfile.write_text(cert)
+        public_key = subprocess.run(["openssl", "pkey", "-in", str(keyfile), "-pubout"], capture_output=True, timeout=5)
+        cert_key = subprocess.run(["openssl", "x509", "-in", str(certfile), "-pubkey", "-noout"], capture_output=True, timeout=5)
+        if public_key.returncode or cert_key.returncode or public_key.stdout.strip() != cert_key.stdout.strip():
+            raise ValueError("Certificate/key mismatch")
+        signed = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(keyfile)], input=message, capture_output=True, timeout=5)
+        if signed.returncode:
+            raise ValueError("Cannot sign state")
+    return {"payload": payload, "certificate": cert, "signature": base64.b64encode(signed.stdout).decode()}
+
+
+def core_running():
+    try:
+        result = subprocess.run(["docker", "top", "remnanode", "-eo", "pid,comm"], capture_output=True, text=True, timeout=8)
+        return result.returncode == 0 and any(name in result.stdout for name in ("rw-core", "xray"))
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def save_state(value):
+    temporary = STATE.with_suffix(".tmp")
+    fd = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        json.dump(value, stream)
+    os.replace(temporary, STATE)
+
+
+def send_once():
+    if not CONFIG.exists():
+        return
+    previous = {}
+    try:
+        previous = json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        pass
+    state = {"last_attempt": int(time.time()), "last_success": previous.get("last_success"), "last_error": None}
+    try:
+        config = json.loads(CONFIG.read_text())
+        request = urllib.request.Request(ENDPOINT, data=json.dumps(proof(config, core_running())).encode(),
+                                         headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(request, timeout=15) as response:
+            if response.status != 200 or not json.load(response).get("ok"):
+                raise ValueError("Rejected")
+        state["last_success"] = int(time.time())
+    except urllib.error.HTTPError as error:
+        state["last_error"] = "HTTP " + str(error.code)
+        error.close()
+    except Exception as error:
+        state["last_error"] = type(error).__name__
+    save_state(state)
+
+
+if __name__ == "__main__":
+    if "--validate" in sys.argv:
+        try:
+            proof(json.load(sys.stdin), False)
+        except Exception:
+            raise SystemExit(1)
+    else:
+        send_once()
+STATUS_AGENT
+chmod 0750 /opt/remnanode-manager/status_agent.py
+
+cat > /etc/systemd/system/remnanode-status.service <<'STATUS_UNIT'
+[Unit]
+Description=Signed RemnaNode availability heartbeat
+After=network-online.target docker.service
+Wants=network-online.target
+ConditionPathExists=/etc/remnanode-status.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/remnanode-manager/status_agent.py
+User=root
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/remnanode-manager
+TimeoutStartSec=40
+STATUS_UNIT
+
+cat > /etc/systemd/system/remnanode-status.timer <<'STATUS_TIMER'
+[Unit]
+Description=Send RemnaNode availability every minute
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+RandomizedDelaySec=5
+AccuracySec=5
+Unit=remnanode-status.service
+
+[Install]
+WantedBy=timers.target
+STATUS_TIMER
+
 cat > /etc/logrotate.d/remnanode-access <<'ROTATE'
 /var/log/remnanode/access.log /var/log/remnanode/error.log {
     daily
@@ -3115,6 +3320,9 @@ UNIT
 systemctl daemon-reload
 systemctl enable remnanode-manager.service
 systemctl restart remnanode-manager.service
+if [[ -f /etc/remnanode-status.json ]]; then
+  systemctl enable --now remnanode-status.timer
+fi
 if [[ -f /etc/remnanode-access-forwarder.json ]]; then
   systemctl enable --now remnanode-access-forwarder.service
   systemctl restart remnanode-access-forwarder.service

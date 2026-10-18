@@ -1,0 +1,40 @@
+name: meltun-status
+services:
+  status:
+    build: .
+    container_name: meltun-status
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:3210:8080"
+    volumes:
+      - status-data:/data
+      - ./private/panel-api-token:/run/secrets/panel-api-token:ro
+      - ./private/panel-ca.pem:/run/secrets/panel-ca.pem:ro
+    environment:
+      STATUS_PANEL_URL: http://remnawave:3000/api/nodes
+    networks:
+      - web
+      - panel
+    mem_limit: 160m
+    cpus: 0.5
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+volumes:
+  status-data:
+networks:
+  web:
+    external: true
+    name: meltun_web_meltun_net
+  panel:
+    external: true
+    name: remnawave-network
