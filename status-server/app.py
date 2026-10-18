@@ -25,7 +25,14 @@ MAX_GAP = 150
 ROOT = Path(__file__).parent
 COUNTRIES = {"DE": "Германия", "EE": "Эстония", "SE": "Швеция", "LV": "Латвия",
              "NL": "Нидерланды", "FI": "Финляндия", "TR": "Турция", "KZ": "Казахстан",
-             "US": "США", "RU": "Россия"}
+             "US": "США", "RU": "Россия", "GB": "Великобритания", "FR": "Франция",
+             "PL": "Польша", "LT": "Литва", "UA": "Украина", "CH": "Швейцария",
+             "AT": "Австрия", "CZ": "Чехия", "ES": "Испания", "IT": "Италия",
+             "RO": "Румыния", "BG": "Болгария", "NO": "Норвегия", "DK": "Дания",
+             "CA": "Канада", "AU": "Австралия", "BR": "Бразилия", "JP": "Япония",
+             "SG": "Сингапур", "HK": "Гонконг", "AE": "ОАЭ", "IL": "Израиль",
+             "BE": "Бельгия", "IE": "Ирландия", "PT": "Португалия", "AM": "Армения",
+             "GE": "Грузия", "MD": "Молдова", "RS": "Сербия", "IS": "Исландия"}
 LABELS = {"GERMANY-DARAFOREST": "Германия · Dataforest", "ES-NODA": "Эстония",
           "EE-GAME-NODA": "Эстония · игровой", "SWEDEN-UPHOST": "Швеция",
           "LV-NODA": "Латвия", "NL01-NODA": "Нидерланды", "FINLAND": "Финляндия",
@@ -176,13 +183,30 @@ class Store:
             row = db.execute("SELECT agent_seen,agent_core FROM nodes WHERE id=?", (node_id,)).fetchone()
             return bool(row and row["agent_seen"] and now - row["agent_seen"] < 180 and row["agent_core"] == 0)
 
-    def public(self, days=90, now=None):
+    def public(self, days=90, now=None, hours=None):
         now = time.time() if now is None else now
-        midnight = dt.datetime.fromtimestamp(now, MSK).replace(hour=0, minute=0, second=0, microsecond=0)
-        first = midnight - dt.timedelta(days=days - 1)
-        start = first.timestamp()
+        if hours is not None:
+            if hours not in (3, 6, 12):
+                raise ValueError("Invalid hourly period")
+            start = now - hours * 3600
+            step = 600 if hours == 12 else 300
+            bins = [(start + i * step, min(now, start + (i + 1) * step)) for i in range(hours * 3600 // step)]
+        else:
+            if days not in (7, 30, 90):
+                raise ValueError("Invalid daily period")
+            midnight = dt.datetime.fromtimestamp(now, MSK).replace(hour=0, minute=0, second=0, microsecond=0)
+            first = midnight - dt.timedelta(days=days - 1)
+            start = first.timestamp()
+            step = 86400
+            bins = [((first + dt.timedelta(days=i)).timestamp(), min(now, (first + dt.timedelta(days=i + 1)).timestamp())) for i in range(days)]
         with self.lock, self.connect() as db:
             rows = db.execute("SELECT * FROM nodes WHERE active=1 ORDER BY position,name").fetchall()
+            names, seen = {}, {}
+            for node in rows:
+                code = node["agent_country"] or node["country"]
+                country = COUNTRIES.get(code, "Другая страна")
+                seen[country] = seen.get(country, 0) + 1
+                names[node["id"]] = country + (" #" + str(seen[country]) if seen[country] > 1 else "")
             latest = float(self.meta("last_cycle") or 0)
             fresh = latest > 0 and now - latest <= MAX_GAP
             output = []
@@ -192,9 +216,7 @@ class Store:
                     spans.append({"start": node["last_ts"], "end": min(now, node["last_ts"] + MAX_GAP), "state": node["state"]})
                 history = []
                 totals = {"up": 0., "down": 0., "degraded": 0.}
-                for index in range(days):
-                    day = first + dt.timedelta(days=index)
-                    a, b = day.timestamp(), min(now, (day + dt.timedelta(days=1)).timestamp())
+                for a, b in bins:
                     amounts = {"up": 0., "down": 0., "degraded": 0.}
                     for span in spans:
                         if span["state"] in amounts:
@@ -202,23 +224,25 @@ class Store:
                     measured = sum(amounts.values())
                     for key in amounts:
                         totals[key] += amounts[key]
-                    history.append({"date": day.date().isoformat(), "uptime": round(amounts["up"] / measured * 100, 3) if measured else None,
+                    history.append({"date": dt.datetime.fromtimestamp(a, MSK).date().isoformat(), "start": a, "end": b,
+                                    "uptime": round(amounts["up"] / measured * 100, 3) if measured else None,
                                     "measured_seconds": round(measured), "outage_seconds": round(amounts["down"]),
                                     "degraded_seconds": round(amounts["degraded"])})
                 measured = sum(totals.values())
                 current = node["state"] if fresh and node["last_ts"] and now - node["last_ts"] <= MAX_GAP else "unknown"
-                output.append({"id": node["id"], "name": node["agent_name"] or node["name"],
+                output.append({"id": node["id"], "name": names[node["id"]],
                                "country": node["agent_country"] or node["country"], "state": current,
-                               "latency_ms": round(node["latency"], 1) if node["latency"] is not None else None,
                                "since": node["created"], "last_check": node["last_ts"],
                                "uptime": round(totals["up"] / measured * 100, 3) if measured else None,
                                "measured_seconds": round(measured), "history": history})
-            incidents = [dict(r) for r in db.execute("""SELECT i.id,COALESCE(NULLIF(n.agent_name,''),n.name) AS name,i.start,i.end,i.kind FROM incidents i
+            incidents = [{"id": r["id"], "name": names[r["node_id"]], "start": r["start"], "end": r["end"], "kind": r["kind"]}
+                         for r in db.execute("""SELECT i.id,i.node_id,i.start,i.end,i.kind FROM incidents i
                 JOIN nodes n ON n.id=i.node_id WHERE n.active=1 AND (i.end IS NULL OR i.end>?) ORDER BY i.start DESC LIMIT 40""", (start,))]
         states = [n["state"] for n in output]
         overall = "unknown" if not states or not fresh else ("down" if all(s == "down" for s in states) else
                    "degraded" if any(s in ("down", "degraded") for s in states) else "unknown" if "unknown" in states else "up")
-        return {"state": overall, "days": days, "updated_at": latest or None, "generated_at": now,
+        return {"state": overall, "days": days if hours is None else None, "hours": hours,
+                "period_start": start, "bucket_seconds": step, "updated_at": latest or None, "generated_at": now,
                 "interval_seconds": INTERVAL, "timezone": "Europe/Moscow", "nodes": output, "incidents": incidents}
 
 
@@ -363,18 +387,23 @@ def handler_class(service):
             parsed = urlsplit(self.path)
             if parsed.path == "/api/status":
                 try:
-                    days = int(parse_qs(parsed.query).get("days", ["90"])[0])
+                    args = parse_qs(parsed.query, keep_blank_values=True)
+                    hours = int(args["hours"][0]) if "hours" in args else None
+                    days = int(args.get("days", ["90"])[0])
                     if days not in (7, 30, 90):
+                        raise ValueError()
+                    if hours is not None and (hours not in (3, 6, 12) or "days" in args):
                         raise ValueError()
                 except ValueError:
                     return self.send(400, {"error": "Invalid period"})
-                return self.send(200, service.store.public(days))
+                return self.send(200, service.store.public(days, hours=hours))
             if parsed.path == "/healthz":
                 stamp = float(service.store.meta("last_cycle") or 0)
                 healthy = time.time() - stamp <= MAX_GAP
                 return self.send(200 if healthy else 503, {"ok": healthy})
             assets = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "application/javascript; charset=utf-8"),
-                      "/style.css": ("style.css", "text/css; charset=utf-8"), "/favicon.svg": ("favicon.svg", "image/svg+xml")}
+                      "/style.css": ("style.css", "text/css; charset=utf-8"), "/favicon.svg": ("favicon.svg", "image/svg+xml"),
+                      "/flags.svg": ("flags.svg", "image/svg+xml"), "/theme.js": ("theme.js", "application/javascript; charset=utf-8")}
             if parsed.path in assets:
                 filename, mime = assets[parsed.path]
                 return self.send(200, (ROOT / "static" / filename).read_bytes(), mime)

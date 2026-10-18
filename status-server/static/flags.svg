@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg">
+<symbol id="DE" viewBox="0 0 30 20"><path fill="#171717" d="M0 0h30v7H0z"/><path fill="#d93940" d="M0 7h30v6H0z"/><path fill="#f3c94f" d="M0 13h30v7H0z"/></symbol>
+<symbol id="EE" viewBox="0 0 30 20"><path fill="#4c9bdd" d="M0 0h30v7H0z"/><path fill="#171717" d="M0 7h30v6H0z"/><path fill="#fff" d="M0 13h30v7H0z"/></symbol>
+<symbol id="SE" viewBox="0 0 30 20"><path fill="#2475af" d="M0 0h30v20H0z"/><path stroke="#f5d254" stroke-width="4" d="M11 0v20M0 10h30"/></symbol>
+<symbol id="LV" viewBox="0 0 30 20"><path fill="#8e3544" d="M0 0h30v20H0z"/><path fill="#fff" d="M0 8h30v4H0z"/></symbol>
+<symbol id="NL" viewBox="0 0 30 20"><path fill="#c74c50" d="M0 0h30v7H0z"/><path fill="#fff" d="M0 7h30v6H0z"/><path fill="#3d65a0" d="M0 13h30v7H0z"/></symbol>
+<symbol id="FI" viewBox="0 0 30 20"><path fill="#fff" d="M0 0h30v20H0z"/><path stroke="#3567a2" stroke-width="5" d="M10 0v20M0 10h30"/></symbol>
+<symbol id="TR" viewBox="0 0 30 20"><path fill="#df3e49" d="M0 0h30v20H0z"/><circle cx="12" cy="10" r="6" fill="#fff"/><circle cx="13.5" cy="9" r="4.8" fill="#df3e49"/><path fill="#fff" d="m20 6.5 1 2.4 2.6.2-2 1.7.6 2.6-2.2-1.4-2.2 1.4.6-2.6-2-1.7 2.6-.2Z"/></symbol>
+<symbol id="KZ" viewBox="0 0 30 20"><path fill="#47b8d1" d="M0 0h30v20H0z"/><g fill="none" stroke="#f9d354" stroke-width=".8"><path d="M3 2v16M2 3l2 2-2 2 2 2-2 2 2 2-2 2 2 2"/><circle cx="17" cy="8" r="3.2" stroke-dasharray=".8 1"/><path d="M11 13q6 5 12 0m-10 1q4 4 8 0"/></g><circle cx="17" cy="8" r="2.3" fill="#f9d354"/></symbol>
+<symbol id="US" viewBox="0 0 30 20"><path fill="#fff" d="M0 0h30v20H0z"/><path stroke="#c8525b" stroke-width="1.54" d="M0 .77h30M0 3.85h30M0 6.92h30M0 10h30M0 13.08h30M0 16.15h30M0 19.23h30"/><path fill="#416392" d="M0 0h13v10.8H0z"/><g fill="#fff"><path d="m2 1 .35.8.85.1-.65.6.2.8L2 2.8l-.75.5.2-.8-.65-.6.85-.1ZM6 1l.35.8.85.1-.65.6.2.8L6 2.8l-.75.5.2-.8-.65-.6.85-.1ZM10 1l.35.8.85.1-.65.6.2.8L10 2.8l-.75.5.2-.8-.65-.6.85-.1Z"/><circle cx="2" cy="5.5" r=".6"/><circle cx="6" cy="5.5" r=".6"/><circle cx="10" cy="5.5" r=".6"/><circle cx="4" cy="8.5" r=".6"/><circle cx="8" cy="8.5" r=".6"/></g></symbol>
+<symbol id="RU" viewBox="0 0 30 20"><path fill="#fff" d="M0 0h30v7H0z"/><path fill="#3c6cb5" d="M0 7h30v6H0z"/><path fill="#d34c57" d="M0 13h30v7H0z"/></symbol>
+<symbol id="FR" viewBox="0 0 30 20"><path fill="#fff" d="M0 0h30v20H0z"/><path fill="#365d9a" d="M0 0h10v20H0z"/><path fill="#db535b" d="M20 0h10v20H20z"/></symbol>
+<symbol id="PL" viewBox="0 0 30 20"><path fill="#fff" d="M0 0h30v10H0z"/><path fill="#d94a63" d="M0 10h30v10H0z"/></symbol>
+<symbol id="LT" viewBox="0 0 30 20"><path fill="#ecc44d" d="M0 0h30v7H0z"/><path fill="#36896e" d="M0 7h30v6H0z"/><path fill="#c34b53" d="M0 13h30v7H0z"/></symbol>
+<symbol id="UA" viewBox="0 0 30 20"><path fill="#418ad0" d="M0 0h30v10H0z"/><path fill="#f3d15b" d="M0 10h30v10H0z"/></symbol>
+<symbol id="CH" viewBox="0 0 30 20"><path fill="#d74d53" d="M0 0h30v20H0z"/><path stroke="#fff" stroke-width="4" d="M15 4v12M9 10h12"/></symbol>
+<symbol id="GB" viewBox="0 0 30 20"><path fill="#3e5c92" d="M0 0h30v20H0z"/><path stroke="#fff" stroke-width="4" d="m0 0 30 20M30 0 0 20"/><path stroke="#d55361" stroke-width="1.5" d="m0 0 30 20M30 0 0 20"/><path stroke="#fff" stroke-width="7" d="M15 0v20M0 10h30"/><path stroke="#d55361" stroke-width="4" d="M15 0v20M0 10h30"/></symbol>
+<symbol id="ZZ" viewBox="0 0 30 20"><path fill="#dce5ef" d="M0 0h30v20H0z"/><g fill="none" stroke="#647990" stroke-width="1"><circle cx="15" cy="10" r="7"/><ellipse cx="15" cy="10" rx="3" ry="7"/><path d="M8 10h14M9.5 6h11M9.5 14h11"/></g></symbol>
+</svg>

@@ -55,6 +55,54 @@ class HistoryTests(unittest.TestCase):
         self.store.observe("panel-node", "up", 4, self.now)
         self.assertEqual(self.store.public(7, self.now + 151)["state"], "unknown")
 
+    def test_hourly_windows_have_real_buckets(self):
+        for hours, count, size in ((3, 36, 300), (6, 72, 300), (12, 72, 600)):
+            result = self.store.public(hours=hours, now=self.now)
+            self.assertEqual(len(result["nodes"][0]["history"]), count)
+            self.assertEqual(result["period_start"], self.now - hours * 3600)
+            self.assertEqual(result["bucket_seconds"], size)
+            self.assertEqual(result["nodes"][0]["history"][-1]["end"], self.now)
+
+    def test_hourly_uptime_clips_spans_to_window(self):
+        with self.store.connect() as db:
+            self.store._span(db, "panel-node", self.now - 8 * 3600, self.now - 3600, "up")
+            self.store._span(db, "panel-node", self.now - 3600, self.now, "down")
+        node = self.store.public(hours=3, now=self.now)["nodes"][0]
+        self.assertEqual(node["measured_seconds"], 3 * 3600)
+        self.assertEqual(node["uptime"], 66.667)
+        self.assertEqual(node["history"][-1]["outage_seconds"], 300)
+        self.assertEqual(node["history"][0]["uptime"], 100)
+
+    def test_country_names_and_duplicates_only(self):
+        nodes = inventory() + [{**inventory()[0], "uuid": "ee-1", "countryCode": "EE", "name": "ES-NODA", "viewPosition": 2},
+                               {**inventory()[0], "uuid": "ee-2", "countryCode": "EE", "name": "EE-GAME-NODA", "viewPosition": 3}]
+        self.store.sync(nodes, self.now)
+        result = self.store.public(hours=3, now=self.now)
+        self.assertEqual([node["name"] for node in result["nodes"]], ["Финляндия", "Эстония", "Эстония #2"])
+        self.assertNotIn("latency_ms", result["nodes"][0])
+
+    def test_http_hours_and_rejected_periods(self):
+        from http.server import HTTPServer
+        import threading
+        import urllib.request
+        import urllib.error
+        server = HTTPServer(("127.0.0.1", 0), app.handler_class(app.Service(self.store)))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = "http://127.0.0.1:" + str(server.server_port)
+        try:
+            with urllib.request.urlopen(base + "/api/status?hours=3") as response:
+                self.assertEqual(json.load(response)["hours"], 3)
+            for query in ("hours=5", "hours=3&days=7", "hours="):
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(base + "/api/status?" + query)
+                self.assertEqual(caught.exception.code, 400)
+                caught.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_public_has_no_private_inventory(self):
         text = json.dumps(self.store.public(7, self.now))
         for value in ("198.51.100.20", "cert_hash", "agent_ip", "token", "12345"):
