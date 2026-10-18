@@ -11,6 +11,7 @@ services:
       - status-data:/data
       - ./private/panel-api-token:/run/secrets/panel-api-token:ro
       - ./private/panel-ca.pem:/run/secrets/panel-ca.pem:ro
+      - ./private/status-admin.json:/run/secrets/status-admin.json:ro
     environment:
       STATUS_PANEL_URL: http://remnawave:3000/api/nodes
     networks:

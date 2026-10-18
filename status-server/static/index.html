@@ -7,9 +7,9 @@
   <meta name="description" content="Текущее состояние и история доступности серверов MelTun.">
   <title>Статус серверов — MelTun</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <script src="/theme.js?v=2"></script>
-  <link rel="stylesheet" href="/style.css?v=2">
-  <script defer src="/app.js?v=2"></script>
+  <script src="/theme.js?v=3"></script>
+  <link rel="stylesheet" href="/style.css?v=3">
+  <script defer src="/app.js?v=3"></script>
 </head>
 <body>
 <div class="page">
@@ -31,16 +31,18 @@
       </div>
       <div class="history-caption"><span>История доступности</span><span>Аптайм за период</span></div>
       <div id="servers" class="servers"><p class="loading">Загружаем состояние…</p></div>
-      <div class="legend"><span><i class="swatch up"></i>Работает</span><span><i class="swatch degraded"></i>Частичный сбой</span><span><i class="swatch down"></i>Недоступен</span><span><i class="swatch unknown"></i>Нет данных</span></div>
+      <div class="legend"><span><i class="swatch up"></i>Работает</span><span><i class="swatch degraded"></i>Частичный сбой</span><span><i class="swatch down"></i>Недоступен</span><span><i class="swatch maintenance"></i>Плановые работы</span><span><i class="swatch unknown"></i>Нет данных</span></div>
     </section>
+    <section class="maintenance-section" aria-labelledby="maintenance-title"><div class="section-head"><h2 id="maintenance-title">Плановые работы</h2></div><div id="maintenance-list"><p class="empty">Загружаем расписание…</p></div></section>
     <section class="incidents-section" aria-labelledby="incidents-title">
       <div class="section-head"><h2 id="incidents-title">История сбоев</h2><span class="muted">За выбранный период</span></div>
       <div id="incidents" class="incidents"><p class="empty">История появится после первых проверок.</p></div>
     </section>
-    <details class="method"><summary>Как считается доступность</summary><p>Мы проверяем серверы каждую минуту. Если две проверки подряд не проходят, отмечаем сбой. Когда работа восстанавливается, запись обновляется автоматически.</p><p>Процент показывает, какую часть выбранного времени сервер работал без сбоев. Периоды без наблюдений отмечены серым и не влияют на результат.</p><p>Время указано по Москве. Доступность из вашей сети может отличаться.</p></details>
+    <details class="method"><summary>Как считается доступность</summary><p>Мы проверяем серверы каждую минуту. Если две проверки подряд не проходят, отмечаем сбой. Когда работа восстанавливается, запись обновляется автоматически.</p><p>Процент показывает, какую часть выбранного времени сервер работал без сбоев. Периоды без наблюдений отмечены серым и не влияют на результат. Плановые работы отмечаются отдельно и не скрывают фактическую недоступность.</p><p>Время указано по Москве. Доступность из вашей сети может отличаться.</p></details>
   </main>
   <footer><span>MelTun network</span><span id="updated">Ожидаем первую проверку</span></footer>
 </div>
 <div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+<dialog id="server-dialog" aria-labelledby="server-dialog-title"><div class="dialog-head"><h2 id="server-dialog-title">Сервер</h2><button type="button" id="server-dialog-close" class="close-button" aria-label="Закрыть подробности">×</button></div><div id="server-dialog-body"></div></dialog>
 </body>
 </html>
