@@ -29,7 +29,18 @@ function duration(seconds) {
   if (seconds < 86400) return (seconds/3600).toLocaleString('ru-RU',{maximumFractionDigits:1})+' ч';
   return (seconds/86400).toLocaleString('ru-RU',{maximumFractionDigits:1})+' дн';
 }
-function bucketClass(bucket) { return bucket.outage_seconds > 0 ? 'down' : bucket.degraded_seconds > 0 ? 'degraded' : bucket.maintenance_seconds > 0 ? 'maintenance' : bucket.uptime === null ? 'unknown' : 'up'; }
+function bucketFill(parts) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('class','bucket-parts'); svg.setAttribute('viewBox','0 0 100 26');
+  svg.setAttribute('preserveAspectRatio','none'); svg.setAttribute('aria-hidden','true');
+  let x = 0;
+  for (const part of parts) {
+    const rect = document.createElementNS('http://www.w3.org/2000/svg','rect');
+    rect.setAttribute('class','bucket-part '+part.state); rect.setAttribute('x',String(x)); rect.setAttribute('y','0');
+    rect.setAttribute('width',String(part.share*100)); rect.setAttribute('height','26'); svg.append(rect); x += part.share*100;
+  }
+  return svg;
+}
 function bucketText(bucket, hourly) {
   const date = fullDate.format(new Date(bucket.start*1000));
   const range = hourly ? '\n'+clock.format(new Date(bucket.start*1000))+'–'+clock.format(new Date(bucket.end*1000))+' МСК' : '';
@@ -51,7 +62,9 @@ function historyBlock(node, data) {
   history.setAttribute('aria-label','История: '+node.name);
   let selected = node.history.length-1;
   node.history.forEach((bucket,index) => {
-    const b = element('button','day '+bucketClass(bucket)+(bucket.maintenance_seconds ? ' planned' : '')); b.type = 'button'; b.tabIndex = index === selected ? 0 : -1;
+    const parts = historyParts(bucket);
+    const b = element('button','day '+(parts.length === 1 ? parts[0].state : 'mixed')+(bucket.maintenance_seconds ? ' planned' : '')); b.type = 'button'; b.tabIndex = index === selected ? 0 : -1;
+    if (parts.length > 1) b.append(bucketFill(parts));
     const text = bucketText(bucket,Boolean(data.hours)); b.setAttribute('aria-label',text.replaceAll('\n','. '));
     const display = () => showTooltip(b,text);
     b.addEventListener('mouseenter',display); b.addEventListener('mouseleave',() => $('tooltip').hidden = true);

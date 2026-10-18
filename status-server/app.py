@@ -582,7 +582,8 @@ def handler_class(service):
                 return self.send(200 if healthy else 503, {"ok": healthy})
             assets = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "application/javascript; charset=utf-8"),
                       "/style.css": ("style.css", "text/css; charset=utf-8"), "/favicon.svg": ("favicon.svg", "image/svg+xml"),
-                      "/flags.svg": ("flags.svg", "image/svg+xml"), "/theme.js": ("theme.js", "application/javascript; charset=utf-8")}
+                      "/flags.svg": ("flags.svg", "image/svg+xml"), "/theme.js": ("theme.js", "application/javascript; charset=utf-8"),
+                      "/history.js": ("history.js", "application/javascript; charset=utf-8")}
             assets.update({"/admin": ("admin.html", "text/html; charset=utf-8"), "/admin/": ("admin.html", "text/html; charset=utf-8"),
                            "/admin.js": ("admin.js", "application/javascript; charset=utf-8")})
             if parsed.path in assets:

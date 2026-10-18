@@ -7,9 +7,10 @@
   <meta name="description" content="Текущее состояние и история доступности серверов MelTun.">
   <title>Статус серверов — MelTun</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <script src="/theme.js?v=3"></script>
-  <link rel="stylesheet" href="/style.css?v=3">
-  <script defer src="/app.js?v=3"></script>
+  <script src="/theme.js?v=4"></script>
+  <link rel="stylesheet" href="/style.css?v=4">
+  <script defer src="/history.js?v=4"></script>
+  <script defer src="/app.js?v=4"></script>
 </head>
 <body>
 <div class="page">
@@ -31,7 +32,8 @@
       </div>
       <div class="history-caption"><span>История доступности</span><span>Аптайм за период</span></div>
       <div id="servers" class="servers"><p class="loading">Загружаем состояние…</p></div>
-      <div class="legend"><span><i class="swatch up"></i>Работает</span><span><i class="swatch degraded"></i>Частичный сбой</span><span><i class="swatch down"></i>Недоступен</span><span><i class="swatch maintenance"></i>Плановые работы</span><span><i class="swatch unknown"></i>Нет данных</span></div>
+      <div class="legend"><span><i class="swatch up"></i>Время работы</span><span><i class="swatch degraded"></i>Частичный сбой</span><span><i class="swatch down"></i>Недоступность</span><span><i class="swatch maintenance"></i>Плановые работы</span><span><i class="swatch unknown"></i>Нет данных</span></div>
+      <p class="history-note">Цвета внутри столбика показывают долю времени работы и сбоев. Нажмите, чтобы увидеть длительность.</p>
     </section>
     <section class="maintenance-section" aria-labelledby="maintenance-title"><div class="section-head"><h2 id="maintenance-title">Плановые работы</h2></div><div id="maintenance-list"><p class="empty">Загружаем расписание…</p></div></section>
     <section class="incidents-section" aria-labelledby="incidents-title">

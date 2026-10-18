@@ -93,6 +93,9 @@ class HistoryTests(unittest.TestCase):
         try:
             with urllib.request.urlopen(base + "/api/status?hours=3") as response:
                 self.assertEqual(json.load(response)["hours"], 3)
+            with urllib.request.urlopen(base + "/history.js?v=4") as response:
+                self.assertIn("application/javascript", response.headers["Content-Type"])
+                self.assertIn(b"function historyParts", response.read())
             for query in ("hours=5", "hours=3&days=7", "hours="):
                 with self.assertRaises(urllib.error.HTTPError) as caught:
                     urllib.request.urlopen(base + "/api/status?" + query)
